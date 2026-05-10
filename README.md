@@ -49,3 +49,33 @@ Open `http://localhost:3000` and use the built-in UI to:
 - Clicks that look destructive (`create|delete|submit|send|charge|publish`) are automatically blocked and converted to hover-only behavior.
 - Walkthroughs are captured as real Playwright screen recordings (`.webm`) and then transcoded to `video.gif`.
 - If SMTP is not configured, magic links are printed in server logs (console delivery mode).
+
+## Hosted frontend + remote backend
+
+The static frontend can run on Vercel, but the GIF generation backend needs a long-running
+Node service because it launches Playwright/Chromium, records video, runs ffmpeg, and writes
+uploaded/generated files. Deploy the backend with the included `Dockerfile` to a container host
+such as Railway, Render, Fly.io, or Google Cloud Run.
+
+Set these backend env vars in the container host:
+
+- `MASTER_KEY`
+- `DATABASE_URL` or `SUPABASE_DATABASE_URL`
+- `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`
+- `APP_ORIGIN` to the backend public URL, for magic links
+- `FRONTEND_ORIGIN` or `ALLOWED_ORIGINS` to your Vercel frontend URL
+
+Then point the Vercel frontend at that backend by setting this before the UI script loads:
+
+```html
+<script>
+  window.GIF_AGENT_API_BASE_URL = "https://your-backend.example.com";
+</script>
+```
+
+For quick browser testing, you can also set local storage on the Vercel frontend:
+
+```js
+localStorage.setItem("gif_agent_api_base_url", "https://your-backend.example.com");
+location.reload();
+```

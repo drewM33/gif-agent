@@ -26,6 +26,10 @@ const app = express();
 const port = Number(process.env.PORT ?? 3000);
 const publicDir = path.resolve("public");
 const uploadsDir = path.resolve("files", "uploads");
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? process.env.FRONTEND_ORIGIN ?? "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 
 fs.mkdirSync(path.join("files", "recordings"), { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -92,6 +96,21 @@ function getAppOrigin(req: express.Request): string {
   return `${protocol}://${req.get("host")}`;
 }
 
+app.use((req, res, next) => {
+  const origin = req.get("origin")?.replace(/\/+$/, "");
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "content-type");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
 app.use(express.json());
 app.use(cookieParser());
 app.use("/files", express.static(path.resolve("files")));
