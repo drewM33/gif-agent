@@ -1,5 +1,4 @@
 {
   "buildCommand": "npm run build",
-  "installCommand": "npm install && npx playwright install chromium",
-  "outputDirectory": "public"
+  "installCommand": "npm install && npx playwright install chromium"
 }
