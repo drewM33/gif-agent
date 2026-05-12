@@ -26,6 +26,7 @@ const app = express();
 const port = Number(process.env.PORT ?? 3000);
 const publicDir = path.resolve("public");
 const uploadsDir = path.resolve("files", "uploads");
+app.set("trust proxy", 1);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? process.env.FRONTEND_ORIGIN ?? "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
@@ -96,6 +97,20 @@ function getAppOrigin(req: express.Request): string {
   return `${protocol}://${req.get("host")}`;
 }
 
+function getFrontendOrigin(): string | null {
+  return process.env.FRONTEND_ORIGIN?.trim().replace(/\/+$/, "") || null;
+}
+
+function sessionCookieOptions(expires: string): express.CookieOptions {
+  const crossOriginFrontend = Boolean(getFrontendOrigin());
+  return {
+    httpOnly: true,
+    sameSite: crossOriginFrontend ? "none" : "lax",
+    secure: crossOriginFrontend || process.env.NODE_ENV === "production",
+    expires: new Date(expires)
+  };
+}
+
 app.use((req, res, next) => {
   const origin = req.get("origin")?.replace(/\/+$/, "");
   if (origin && allowedOrigins.includes(origin)) {
@@ -149,14 +164,8 @@ app.get("/auth/verify", async (req, res) => {
     return;
   }
 
-  const secure = req.protocol === "https";
-  res.cookie("gif_agent_session", session.sessionToken, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure,
-    expires: new Date(session.sessionExpiresAt)
-  });
-  res.redirect("/");
+  res.cookie("gif_agent_session", session.sessionToken, sessionCookieOptions(session.sessionExpiresAt));
+  res.redirect(getFrontendOrigin() ?? "/");
 });
 
 app.get("/auth/me", async (req, res) => {
