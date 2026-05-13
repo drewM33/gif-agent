@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { chromium, type BrowserContextOptions, type Locator, type Page } from "playwright";
+import { extractJson } from "./json-extract";
+import type { LlmProvider } from "./llm-provider";
 import type { Plan, PlanStep } from "./types";
 
 const BLOCKED_CLICK_TEXT = /create|delete|submit|send|charge|publish/i;
@@ -9,6 +13,7 @@ type StorageState = Exclude<BrowserContextOptions["storageState"], string | unde
 const CAPTCHA_HINT_TEXT = /not a robot|unusual traffic|verify you are human|captcha|recaptcha/i;
 const SELECTOR_TIMEOUT_MS = 2_500;
 const INVISIBLE_RECAPTCHA_FRAME = /google\.com\/recaptcha\/api2\/aframe/i;
+const MAX_REPAIR_CANDIDATES = 80;
 
 const CURSOR_ID = "__gif_agent_cursor";
 
@@ -65,60 +70,32 @@ async function moveCursor(page: Page, x: number, y: number): Promise<void> {
 
 function selectorCandidates(selector: string): string[] {
   const candidates = [selector];
-  const normalized = selector.replace(/\s+/g, "").toLowerCase();
-  const signInLike =
-    normalized.includes("servicelogin") ||
-    normalized.includes("accounts.google.com") ||
-    normalized.includes("signin") ||
-    normalized.includes("sign-in") ||
-    normalized.includes("sign_in") ||
-    normalized.includes("sign in");
-  const predictionMarketsLike =
-    normalized.includes("prediction-markets") || normalized.includes("predictionmarkets");
-  const composeLike = normalized.includes("compose");
+  const phrases = new Set<string>();
 
-  if (normalized === "input[name='q']" || normalized === 'input[name="q"]') {
-    candidates.push(
-      'textarea[name="q"]',
-      '[name="q"]',
-      'textarea[aria-label="Search"]',
-      'input[aria-label="Search"]'
-    );
+  for (const match of selector.matchAll(/["']([^"']{2,120})["']/g)) {
+    const phrase = match[1].replace(/^https?:\/\/[^/]+\//i, "").replace(/[/?#].*$/, "");
+    if (phrase) phrases.add(phrase);
   }
 
-  if (signInLike) {
-    candidates.push(
-      'a[href*="ServiceLogin"]',
-      'a[href*="accounts.google.com"]',
-      'a[aria-label*="Sign in" i]',
-      'button[aria-label*="Sign in" i]',
-      'a:has-text("Sign in")',
-      'button:has-text("Sign in")',
-      'text=Sign in'
-    );
+  for (const raw of Array.from(phrases)) {
+    const words = raw
+      .replace(/[-_+/]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (words && words !== raw) phrases.add(words.replace(/\b\w/g, (c) => c.toUpperCase()));
   }
 
-  if (predictionMarketsLike) {
+  for (const phrase of phrases) {
+    const cssText = phrase.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     candidates.push(
-      'a[href*="prediction-markets"]',
-      'a:has-text("Prediction Markets")',
-      'button:has-text("Prediction Markets")',
-      'text=Prediction Markets'
-    );
-  }
-
-  if (composeLike) {
-    candidates.push(
-      '[aria-label*="Compose" i]',
-      '[role="button"][aria-label*="Compose" i]',
-      'div[role="button"][aria-label*="Compose" i]',
-      'a[role="button"][aria-label*="Compose" i]',
-      'button[aria-label*="Compose" i]',
-      '[role="button"]:has-text("Compose")',
-      'div:has-text("Compose")',
-      'a:has-text("Compose")',
-      'button:has-text("Compose")',
-      'text=Compose'
+      `[aria-label*="${cssText}" i]`,
+      `[title*="${cssText}" i]`,
+      `[placeholder*="${cssText}" i]`,
+      `[role="button"]:has-text("${cssText}")`,
+      `[role="link"]:has-text("${cssText}")`,
+      `a:has-text("${cssText}")`,
+      `button:has-text("${cssText}")`,
+      `text=${phrase}`
     );
   }
 
@@ -144,12 +121,236 @@ async function firstVisibleLocator(page: Page, selector: string): Promise<Locato
   return null;
 }
 
-async function requireVisibleLocator(page: Page, selector: string, action: string): Promise<Locator> {
-  const locator = await firstVisibleLocator(page, selector);
+type SelectorRepairOptions = {
+  apiKey?: string;
+  llmProvider?: LlmProvider;
+  taskGoal?: string;
+};
+
+type RepairCandidate = {
+  index: number;
+  tag: string;
+  text: string;
+  ariaLabel: string | null;
+  title: string | null;
+  role: string | null;
+  href: string | null;
+  placeholder: string | null;
+  name: string | null;
+  id: string | null;
+  rect: { x: number; y: number; width: number; height: number };
+};
+
+async function collectRepairCandidates(page: Page): Promise<RepairCandidate[]> {
+  return page.evaluate((maxCandidates) => {
+    const selector = [
+      "a",
+      "button",
+      "input",
+      "textarea",
+      "select",
+      '[role="button"]',
+      '[role="link"]',
+      '[role="menuitem"]',
+      '[contenteditable="true"]',
+      "[tabindex]"
+    ].join(",");
+
+    const nodes = Array.from(document.querySelectorAll<HTMLElement>(selector));
+    const candidates: RepairCandidate[] = [];
+    for (const node of nodes) {
+      if (node.id === "__gif_agent_cursor" || node.id === "__gif_agent_caption") continue;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      const visible =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        Number(style.opacity || "1") > 0;
+      if (!visible) continue;
+
+      const index = candidates.length;
+      node.setAttribute("data-gif-agent-candidate", String(index));
+      candidates.push({
+        index,
+        tag: node.tagName.toLowerCase(),
+        text: (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 140),
+        ariaLabel: node.getAttribute("aria-label"),
+        title: node.getAttribute("title"),
+        role: node.getAttribute("role"),
+        href: node.getAttribute("href"),
+        placeholder: node.getAttribute("placeholder"),
+        name: node.getAttribute("name"),
+        id: node.id || null,
+        rect: {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        }
+      });
+
+      if (candidates.length >= maxCandidates) break;
+    }
+    return candidates;
+  }, MAX_REPAIR_CANDIDATES);
+}
+
+function buildRepairPrompt(input: {
+  step: Extract<PlanStep, { selector: string }>;
+  action: string;
+  url: string;
+  candidates: RepairCandidate[];
+  taskGoal?: string;
+}): string {
+  return `
+You are repairing a browser automation selector using the current screenshot and visible interactive elements.
+
+Overall user request: ${input.taskGoal ?? "unknown"}
+Current URL: ${input.url}
+Intended action: ${input.action}
+Original selector that failed: ${input.step.selector}
+Step caption: ${input.step.caption ?? "none"}
+${"text" in input.step ? `Text to type: ${input.step.text}` : ""}
+
+Visible candidates:
+${JSON.stringify(input.candidates, null, 2)}
+
+Pick the single candidate that best matches the intended action. Understand semantic intent:
+- Infer what the user is trying to do from the screenshot, the overall request, the step caption, and candidate labels.
+- Choose the visible control that a human would use next for that intent, even if its text is not an exact selector match.
+- Prefer controls whose visual position, accessibility label, text, or iconography supports the intended action.
+
+Return JSON only:
+{
+  "candidateIndex": 0,
+  "confidence": 0.0,
+  "reason": "brief visual/accessibility evidence"
+}
+
+If no candidate matches, return {"candidateIndex": null, "confidence": 0, "reason": "why"}.
+`.trim();
+}
+
+async function repairSelectorWithOpenAI(
+  page: Page,
+  step: Extract<PlanStep, { selector: string }>,
+  action: string,
+  candidates: RepairCandidate[],
+  apiKey: string,
+  taskGoal?: string
+): Promise<number | null> {
+  const client = new OpenAI({ apiKey });
+  const model = process.env.OPENAI_VISION_MODEL ?? "gpt-4o";
+  const screenshot = await page.screenshot({ type: "png", fullPage: false });
+  const completion = await client.chat.completions.create({
+    model,
+    max_tokens: 400,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: buildRepairPrompt({ step, action, url: page.url(), candidates, taskGoal }) },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${screenshot.toString("base64")}` } }
+        ]
+      }
+    ]
+  });
+  const parsed = JSON.parse(extractJson(completion.choices[0]?.message?.content ?? "{}")) as {
+    candidateIndex?: number | null;
+    confidence?: number;
+  };
+  return typeof parsed.candidateIndex === "number" && (parsed.confidence ?? 0) >= 0.35
+    ? parsed.candidateIndex
+    : null;
+}
+
+async function repairSelectorWithAnthropic(
+  page: Page,
+  step: Extract<PlanStep, { selector: string }>,
+  action: string,
+  candidates: RepairCandidate[],
+  apiKey: string,
+  taskGoal?: string
+): Promise<number | null> {
+  const client = new Anthropic({ apiKey });
+  const model = process.env.ANTHROPIC_VISION_MODEL ?? process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514";
+  const screenshot = await page.screenshot({ type: "png", fullPage: false });
+  const response = await client.messages.create({
+    model,
+    max_tokens: 400,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: buildRepairPrompt({ step, action, url: page.url(), candidates, taskGoal }) },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: screenshot.toString("base64")
+            }
+          }
+        ]
+      }
+    ]
+  });
+  const text = response.content.map((block) => ("text" in block ? block.text : "")).join("\n");
+  const parsed = JSON.parse(extractJson(text || "{}")) as { candidateIndex?: number | null; confidence?: number };
+  return typeof parsed.candidateIndex === "number" && (parsed.confidence ?? 0) >= 0.35
+    ? parsed.candidateIndex
+    : null;
+}
+
+async function repairVisibleLocator(
+  page: Page,
+  step: Extract<PlanStep, { selector: string }>,
+  action: string,
+  options: SelectorRepairOptions
+): Promise<Locator | null> {
+  const provider = options.llmProvider ?? "anthropic";
+  const apiKey =
+    options.apiKey?.trim() ||
+    (provider === "openai" ? process.env.OPENAI_API_KEY?.trim() : process.env.ANTHROPIC_API_KEY?.trim());
+  if (!apiKey) return null;
+
+  const candidates = await collectRepairCandidates(page);
+  if (candidates.length === 0) return null;
+
+  const index =
+    provider === "openai"
+      ? await repairSelectorWithOpenAI(page, step, action, candidates, apiKey, options.taskGoal)
+      : await repairSelectorWithAnthropic(page, step, action, candidates, apiKey, options.taskGoal);
+  if (index === null) return null;
+
+  const locator = page.locator(`[data-gif-agent-candidate="${index}"]`).first();
+  return (await locator.isVisible().catch(() => false)) ? locator : null;
+}
+
+async function requireVisibleLocator(
+  page: Page,
+  step: Extract<PlanStep, { selector: string }>,
+  action: string,
+  options: SelectorRepairOptions
+): Promise<Locator> {
+  const locator = (await firstVisibleLocator(page, step.selector)) ?? (await repairVisibleLocator(page, step, action, options));
   if (!locator) {
-    throw new Error(`Could not ${action}: no visible element matched ${selector}`);
+    throw new Error(`Could not ${action}: no visible element matched ${step.selector}`);
   }
   return locator;
+}
+
+async function optionalVisibleLocator(
+  page: Page,
+  step: Extract<PlanStep, { selector: string }>,
+  action: string,
+  options: SelectorRepairOptions
+): Promise<Locator | null> {
+  const locator = await firstVisibleLocator(page, step.selector);
+  return locator ?? repairVisibleLocator(page, step, action, options);
 }
 
 async function moveCursorToLocator(locator: Locator): Promise<void> {
@@ -274,6 +475,7 @@ export async function executePlan(input: {
   taskId: string;
   storageState?: StorageState;
   manualAssist?: boolean;
+  selectorRepair?: SelectorRepairOptions;
 }): Promise<{ recordedVideoPath: string }> {
   const recordingsDir = path.join("files", "recordings", input.taskId);
   fs.mkdirSync(recordingsDir, { recursive: true });
@@ -307,7 +509,7 @@ export async function executePlan(input: {
         break;
       case "hover":
         {
-          const locator = await firstVisibleLocator(page, step.selector);
+          const locator = await optionalVisibleLocator(page, step, "hover", input.selectorRepair ?? {});
           if (!locator) {
             await applyCaption(page, `Could not find ${step.selector}; continuing.`);
             await page.waitForTimeout(700);
@@ -321,7 +523,7 @@ export async function executePlan(input: {
         break;
       case "highlight":
         {
-          const locator = await firstVisibleLocator(page, step.selector);
+          const locator = await optionalVisibleLocator(page, step, "highlight", input.selectorRepair ?? {});
           if (!locator) {
             await applyCaption(page, `Could not find ${step.selector}; continuing.`);
             await page.waitForTimeout(700);
@@ -338,7 +540,7 @@ export async function executePlan(input: {
         break;
       case "type":
         {
-          const locator = await requireVisibleLocator(page, step.selector, "type into");
+          const locator = await requireVisibleLocator(page, step, "type into", input.selectorRepair ?? {});
           await moveCursorToLocator(locator);
           await locator.fill(step.text);
         }
@@ -351,7 +553,7 @@ export async function executePlan(input: {
         break;
       case "click":
         {
-          const locator = await requireVisibleLocator(page, step.selector, "click");
+          const locator = await requireVisibleLocator(page, step, "click", input.selectorRepair ?? {});
           await moveCursorToLocator(locator);
         if (shouldBlockClick(step)) {
           await locator.hover();

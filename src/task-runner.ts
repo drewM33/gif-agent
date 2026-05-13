@@ -43,7 +43,12 @@ export async function runTask(taskId: string, options: TaskRunOptions = {}): Pro
       storageState: task.connectionId
         ? await getConnectionState(task.connectionId)
         : undefined,
-      manualAssist: options.manualAssist ?? false
+      manualAssist: options.manualAssist ?? false,
+      selectorRepair: {
+        apiKey: options.apiKey,
+        llmProvider: options.llmProvider,
+        taskGoal: task.question
+      }
     });
 
     const gifPath = path.join("files", "recordings", taskId, "video.gif");
