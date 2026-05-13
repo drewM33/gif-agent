@@ -632,7 +632,12 @@ export async function executePlan(input: {
         break;
       case "click":
         {
-          const locator = await requireVisibleLocator(page, step, "click", input.selectorRepair ?? {});
+          const locator = await optionalVisibleLocator(page, step, "click", input.selectorRepair ?? {});
+          if (!locator) {
+            await applyCaption(page, `Could not find ${step.selector}; skipping click.`);
+            await page.waitForTimeout(700);
+            break;
+          }
           await moveCursorToLocator(locator);
           if (shouldBlockClick(step)) {
             await locator.hover();
@@ -642,12 +647,20 @@ export async function executePlan(input: {
             );
             await page.waitForTimeout(900);
           } else {
-            const method = await clickLocator(locator);
-            await applyCaption(
-              page,
-              step.caption ?? (method === "dom" ? `Click ${step.selector} (overlay bypass)` : `Click ${step.selector}`)
-            );
-            await page.waitForTimeout(900);
+            try {
+              const method = await clickLocator(locator);
+              await applyCaption(
+                page,
+                step.caption ??
+                  (method === "dom" ? `Click ${step.selector} (overlay bypass)` : `Click ${step.selector}`)
+              );
+              await page.waitForTimeout(900);
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              console.warn(`[executor] click failed for ${step.selector}: ${detail}`);
+              await applyCaption(page, `Click on ${step.selector} did not land; continuing.`);
+              await page.waitForTimeout(700);
+            }
           }
         }
         break;
