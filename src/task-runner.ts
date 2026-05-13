@@ -10,6 +10,7 @@ import type { Plan } from "./types";
 type TaskRunOptions = {
   manualAssist?: boolean;
   screenshotFilePath?: string;
+  startUrlHint?: string;
   apiKey?: string;
   llmProvider?: LlmProvider;
 };
@@ -24,7 +25,7 @@ export async function runTask(taskId: string, options: TaskRunOptions = {}): Pro
     const connection = task.connectionId ? await getConnection(task.connectionId) : null;
     const plannerInput = {
       question: task.question,
-      startUrlHint: connection?.startUrl ?? undefined
+      startUrlHint: connection?.startUrl ?? options.startUrlHint
     };
     const plannerOptions = {
       apiKey: options.apiKey,

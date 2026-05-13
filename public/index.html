@@ -857,6 +857,7 @@
         try {
           const formData = new FormData();
           formData.append("description", text);
+          formData.append("pageUrl", window.location.href);
           if (selectedFile) formData.append("screenshot", selectedFile);
           const conn = connectionId.value.trim();
           if (conn) formData.append("connectionId", conn);

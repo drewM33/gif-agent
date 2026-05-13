@@ -62,6 +62,19 @@ function parseApiKey(value: unknown): string | undefined {
   return trimmed.slice(0, 512);
 }
 
+function parseOptionalHttpUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 type ResolvedTaskLlm = {
   apiKey?: string;
   llmProvider: LlmProvider;
@@ -234,6 +247,7 @@ app.post("/tasks", async (req, res) => {
   const user = await getSessionUser(req.cookies?.gif_agent_session);
   const question = String(req.body?.question ?? "").trim();
   const manualAssist = parseBoolean(req.body?.manualAssist);
+  const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
   const resolved = await resolveTaskLlm(user, req.body);
   if (resolved.savedKeyProviderMismatch) {
     res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
@@ -253,7 +267,7 @@ app.post("/tasks", async (req, res) => {
   const id = randomUUID();
   await insertTask({ id, question, connectionId });
 
-  void runTask(id, { manualAssist, apiKey, llmProvider });
+  void runTask(id, { manualAssist, apiKey, llmProvider, startUrlHint });
 
   res.status(202).json({
     id,
@@ -266,6 +280,7 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
   const user = await getSessionUser(req.cookies?.gif_agent_session);
   const description = String(req.body?.description ?? "").trim();
   const manualAssist = parseBoolean(req.body?.manualAssist);
+  const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
   const resolved = await resolveTaskLlm(user, req.body);
   if (resolved.savedKeyProviderMismatch) {
     res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
@@ -291,7 +306,7 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
 
   const id = randomUUID();
   await insertTask({ id, question, connectionId });
-  void runTask(id, { manualAssist, screenshotFilePath: req.file?.path, apiKey, llmProvider });
+  void runTask(id, { manualAssist, screenshotFilePath: req.file?.path, apiKey, llmProvider, startUrlHint });
 
   res.status(202).json({
     id,
