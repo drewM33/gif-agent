@@ -249,6 +249,10 @@ function shouldBlockClick(step: Extract<PlanStep, { action: "click" }>): boolean
   return BLOCKED_CLICK_TEXT.test(step.selector);
 }
 
+function canRunHeadedBrowser(): boolean {
+  return process.env.ENABLE_HEADFUL_BROWSER === "true";
+}
+
 export async function executePlan(input: {
   plan: Plan;
   taskId: string;
@@ -258,7 +262,8 @@ export async function executePlan(input: {
   const recordingsDir = path.join("files", "recordings", input.taskId);
   fs.mkdirSync(recordingsDir, { recursive: true });
 
-  const browser = await chromium.launch({ headless: !(input.manualAssist ?? false) });
+  const canUseManualAssist = Boolean(input.manualAssist) && canRunHeadedBrowser();
+  const browser = await chromium.launch({ headless: !canUseManualAssist });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     storageState: input.storageState,
@@ -273,7 +278,7 @@ export async function executePlan(input: {
   await page.goto(input.plan.startUrl, { waitUntil: "domcontentloaded" });
   await ensureCursor(page);
   await applyCaption(page, "Opened start URL");
-  await maybeHandleCaptcha(page, input.manualAssist ?? false);
+  await maybeHandleCaptcha(page, canUseManualAssist);
   await page.waitForTimeout(700);
 
   for (const step of input.plan.steps) {
@@ -281,7 +286,7 @@ export async function executePlan(input: {
       case "navigate":
         await page.goto(step.url, { waitUntil: "domcontentloaded" });
         await applyCaption(page, step.caption ?? `Navigate to ${step.url}`);
-        await maybeHandleCaptcha(page, input.manualAssist ?? false);
+        await maybeHandleCaptcha(page, canUseManualAssist);
         await page.waitForTimeout(700);
         break;
       case "hover":
@@ -350,7 +355,7 @@ export async function executePlan(input: {
         break;
     }
 
-    await maybeHandleCaptcha(page, input.manualAssist ?? false);
+    await maybeHandleCaptcha(page, canUseManualAssist);
   }
 
   await context.close();

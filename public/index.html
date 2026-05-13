@@ -487,6 +487,7 @@
         window.localStorage.getItem("gif_agent_api_base_url") ||
         ""
       ).replace(/\/+$/, "");
+      const isRemoteBackend = Boolean(API_BASE_URL) && API_BASE_URL !== window.location.origin.replace(/\/+$/, "");
       const LLM_STORAGE_KEY = "gif_agent_llm_provider";
       let llmProvider =
         window.localStorage.getItem(LLM_STORAGE_KEY) === "openai" ? "openai" : "anthropic";
@@ -514,6 +515,16 @@
       llmAnthropic.addEventListener("click", () => setLlmProvider("anthropic"));
       llmOpenai.addEventListener("click", () => setLlmProvider("openai"));
       syncLlmToggleUi();
+
+      if (isRemoteBackend) {
+        manualAssist.checked = false;
+        manualAssist.disabled = true;
+        const manualAssistLabel = manualAssist.closest("label");
+        if (manualAssistLabel) {
+          manualAssistLabel.title =
+            "Manual assist opens a local browser window and is only available when the backend is running on your machine.";
+        }
+      }
 
       function authMenuButtonLabel(email) {
         if (!email) {
@@ -864,7 +875,7 @@
           formData.append("llmProvider", llmProvider);
           const key = apiKey.value.trim();
           if (key) formData.append("apiKey", key);
-          if (manualAssist.checked) formData.append("manualAssist", "true");
+          if (!manualAssist.disabled && manualAssist.checked) formData.append("manualAssist", "true");
 
           const createResp = await fetch(apiUrl("/ui/tasks"), {
             method: "POST",
