@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>gif-agent</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        width: 320px;
+        margin: 0;
+        padding: 12px;
+        font-size: 13px;
+      }
+      label {
+        display: block;
+        margin-top: 8px;
+        font-weight: 600;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 4px;
+        padding: 6px 8px;
+      }
+      button {
+        margin-top: 10px;
+        width: 100%;
+        padding: 8px;
+        cursor: pointer;
+      }
+      .muted {
+        color: #666;
+        font-size: 12px;
+        margin-top: 6px;
+      }
+      .ok {
+        color: #15803d;
+      }
+      .err {
+        color: #b91c1c;
+      }
+    </style>
+  </head>
+  <body>
+    <div><strong>gif-agent</strong> — session capture</div>
+    <p class="muted">Pair once from the web app, then capture while on the site you are logged into.</p>
+
+    <label for="apiBase">API base URL</label>
+    <input id="apiBase" type="url" placeholder="https://your-backend.example.com" />
+
+    <label for="pairCode">Pairing code (from web app)</label>
+    <input id="pairCode" type="text" maxlength="12" autocomplete="off" placeholder="e.g. ABC123" />
+
+    <button id="pairBtn" type="button">Exchange code for token</button>
+
+    <label for="connName">Connection name</label>
+    <input id="connName" type="text" placeholder="Work dashboard" />
+
+    <label for="extraHosts">Extra cookie hosts (optional, comma-separated)</label>
+    <input id="extraHosts" type="text" placeholder="accounts.google.com" />
+
+    <button id="captureBtn" type="button" disabled>Capture this tab</button>
+
+    <div id="msg" class="muted"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

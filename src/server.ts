@@ -15,7 +15,17 @@ import {
   type AuthUser
 } from "./auth";
 import { finishConnectionLogin, startConnectionLogin } from "./connections";
-import { getTask, initDatabase, insertTask, usePostgres } from "./db";
+import {
+  getConnection,
+  getTask,
+  initDatabase,
+  insertTask,
+  listConnectionsByUserId,
+  revokeExtensionTokensForUserId,
+  usePostgres
+} from "./db";
+import { importConnectionFromStorageState, parseExtraHostsField, type PlaywrightStorageState } from "./connection-import";
+import { exchangePairingCode, startExtensionPairing, verifyExtensionBearer } from "./extension-tokens";
 import { parseLlmProvider, type LlmProvider } from "./llm-provider";
 import { runTask } from "./task-runner";
 
@@ -31,6 +41,40 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? process.env.FRONTEND_ORIG
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
+
+const importRateBuckets = new Map<string, { n: number; resetAt: number }>();
+const IMPORT_RATE_LIMIT = 30;
+const IMPORT_RATE_WINDOW_MS = 60_000;
+
+function allowImportForUser(userId: string): boolean {
+  const now = Date.now();
+  const row = importRateBuckets.get(userId);
+  if (!row || now > row.resetAt) {
+    importRateBuckets.set(userId, { n: 1, resetAt: now + IMPORT_RATE_WINDOW_MS });
+    return true;
+  }
+  if (row.n >= IMPORT_RATE_LIMIT) {
+    return false;
+  }
+  row.n += 1;
+  return true;
+}
+
+async function assertConnectionUsable(user: AuthUser | null, connectionId: string | null): Promise<void> {
+  if (!connectionId) return;
+  const conn = await getConnection(connectionId);
+  if (!conn) {
+    throw Object.assign(new Error("Connection not found."), { status: 404 });
+  }
+  if (conn.userId) {
+    if (!user || user.id !== conn.userId) {
+      throw Object.assign(
+        new Error("That connection belongs to another account. Sign in as the owner or pick a different connection."),
+        { status: 403 }
+      );
+    }
+  }
+}
 
 fs.mkdirSync(path.join("files", "recordings"), { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -125,21 +169,22 @@ function sessionCookieOptions(expires: string): express.CookieOptions {
 }
 
 app.use((req, res, next) => {
-  const origin = req.get("origin")?.replace(/\/+$/, "");
-  if (origin && allowedOrigins.includes(origin)) {
+  const origin = req.get("origin")?.replace(/\/+$/, "") ?? "";
+  const allowChromeExt = origin.startsWith("chrome-extension://");
+  if (origin && (allowedOrigins.includes(origin) || allowChromeExt)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "content-type");
+  res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
   if (req.method === "OPTIONS") {
     res.status(204).end();
     return;
   }
   next();
 });
-app.use(express.json());
+app.use(express.json({ limit: "320kb" }));
 app.use(cookieParser());
 app.use("/files", express.static(path.resolve("files")));
 app.use(express.static(publicDir));
@@ -198,7 +243,11 @@ app.get("/auth/me", async (req, res) => {
 });
 
 app.post("/auth/logout", async (req, res) => {
+  const user = await getSessionUser(req.cookies?.gif_agent_session);
   await revokeSession(req.cookies?.gif_agent_session);
+  if (user) {
+    await revokeExtensionTokensForUserId(user.id, new Date().toISOString());
+  }
   res.clearCookie("gif_agent_session");
   res.json({ ok: true });
 });
@@ -229,7 +278,8 @@ app.post("/connections/login", async (req, res) => {
     res.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ error: message });
+    const status = message.includes("Headed browser login is disabled") ? 403 : 500;
+    res.status(status).json({ error: message });
   }
 });
 
@@ -243,78 +293,208 @@ app.post("/connections/login/:loginId/finish", async (req, res) => {
   }
 });
 
+app.get("/connections", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.cookies?.gif_agent_session);
+    if (!user) {
+      res.status(401).json({ error: "Not authenticated." });
+      return;
+    }
+    const rows = await listConnectionsByUserId(user.id);
+    res.json({
+      connections: rows.map((c) => ({
+        id: c.id,
+        name: c.name,
+        domain: c.domain,
+        startUrl: c.startUrl,
+        createdAt: c.createdAt
+      }))
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post("/connections/pair/start", async (req, res) => {
+  try {
+    const user = await getSessionUser(req.cookies?.gif_agent_session);
+    if (!user) {
+      res.status(401).json({ error: "Not authenticated." });
+      return;
+    }
+    const out = await startExtensionPairing(user.id);
+    res.json(out);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post("/connections/pair/exchange", async (req, res) => {
+  try {
+    const code = String(req.body?.code ?? "").trim();
+    if (!code) {
+      res.status(400).json({ error: "code is required." });
+      return;
+    }
+    const out = await exchangePairingCode(code);
+    res.json(out);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    const status = message.includes("Invalid") || message.includes("expired") ? 400 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
+app.post("/connections/import", async (req, res) => {
+  try {
+    const bearerUserId = await verifyExtensionBearer(req.get("authorization"));
+    const sessionUser = await getSessionUser(req.cookies?.gif_agent_session);
+    const userId = bearerUserId ?? (sessionUser ? sessionUser.id : null);
+    if (!userId) {
+      res.status(401).json({ error: "Authenticate with a Bearer extension token or sign in to the web app." });
+      return;
+    }
+
+    const name = String(req.body?.name ?? "").trim();
+    const startUrl = String(req.body?.startUrl ?? "").trim();
+    const storageState = req.body?.storageState as PlaywrightStorageState | undefined;
+    const extraHosts = parseExtraHostsField(
+      typeof req.body?.extraHosts === "string"
+        ? req.body.extraHosts
+        : Array.isArray(req.body?.extraHosts)
+          ? (req.body.extraHosts as string[]).join(",")
+          : undefined
+    );
+
+    if (!storageState || typeof storageState !== "object") {
+      res.status(400).json({ error: "storageState object is required." });
+      return;
+    }
+    if (!startUrl) {
+      res.status(400).json({ error: "startUrl is required (current page URL)." });
+      return;
+    }
+    if (!allowImportForUser(userId)) {
+      res.status(429).json({ error: "Too many imports. Try again in a minute." });
+      return;
+    }
+
+    const result = await importConnectionFromStorageState({
+      userId,
+      name: name || "Imported session",
+      startUrl,
+      storageState,
+      extraHosts
+    });
+    res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(400).json({ error: message });
+  }
+});
+
 app.post("/tasks", async (req, res) => {
-  const user = await getSessionUser(req.cookies?.gif_agent_session);
-  const question = String(req.body?.question ?? "").trim();
-  const manualAssist = parseBoolean(req.body?.manualAssist);
-  const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
-  const resolved = await resolveTaskLlm(user, req.body);
-  if (resolved.savedKeyProviderMismatch) {
-    res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
-    return;
+  try {
+    const user = await getSessionUser(req.cookies?.gif_agent_session);
+    const question = String(req.body?.question ?? "").trim();
+    const manualAssist = parseBoolean(req.body?.manualAssist);
+    const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
+    const resolved = await resolveTaskLlm(user, req.body);
+    if (resolved.savedKeyProviderMismatch) {
+      res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
+      return;
+    }
+    const { apiKey, llmProvider } = resolved;
+    const connectionId =
+      req.body?.connectionId === null || req.body?.connectionId === undefined
+        ? null
+        : String(req.body.connectionId);
+
+    if (!question) {
+      res.status(400).json({ error: "question is required." });
+      return;
+    }
+
+    await assertConnectionUsable(user, connectionId);
+
+    const id = randomUUID();
+    await insertTask({ id, question, connectionId });
+
+    void runTask(id, { manualAssist, apiKey, llmProvider, startUrlHint });
+
+    res.status(202).json({
+      id,
+      status: "queued",
+      statusUrl: `/tasks/${id}`
+    });
+  } catch (error) {
+    const status =
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      typeof (error as { status: unknown }).status === "number"
+        ? (error as { status: number }).status
+        : 500;
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(status).json({ error: message });
   }
-  const { apiKey, llmProvider } = resolved;
-  const connectionId =
-    req.body?.connectionId === null || req.body?.connectionId === undefined
-      ? null
-      : String(req.body.connectionId);
-
-  if (!question) {
-    res.status(400).json({ error: "question is required." });
-    return;
-  }
-
-  const id = randomUUID();
-  await insertTask({ id, question, connectionId });
-
-  void runTask(id, { manualAssist, apiKey, llmProvider, startUrlHint });
-
-  res.status(202).json({
-    id,
-    status: "queued",
-    statusUrl: `/tasks/${id}`
-  });
 });
 
 app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
-  const user = await getSessionUser(req.cookies?.gif_agent_session);
-  const description = String(req.body?.description ?? "").trim();
-  const manualAssist = parseBoolean(req.body?.manualAssist);
-  const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
-  const resolved = await resolveTaskLlm(user, req.body);
-  if (resolved.savedKeyProviderMismatch) {
-    res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
-    return;
+  try {
+    const user = await getSessionUser(req.cookies?.gif_agent_session);
+    const description = String(req.body?.description ?? "").trim();
+    const manualAssist = parseBoolean(req.body?.manualAssist);
+    const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
+    const resolved = await resolveTaskLlm(user, req.body);
+    if (resolved.savedKeyProviderMismatch) {
+      res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
+      return;
+    }
+    const { apiKey, llmProvider } = resolved;
+    const connectionId =
+      req.body?.connectionId === null ||
+      req.body?.connectionId === undefined ||
+      String(req.body?.connectionId).trim() === ""
+        ? null
+        : String(req.body.connectionId).trim();
+
+    if (!description) {
+      res.status(400).json({ error: "description is required." });
+      return;
+    }
+
+    await assertConnectionUsable(user, connectionId);
+
+    const screenshotPath = req.file ? `/files/uploads/${req.file.filename}` : null;
+    const question = screenshotPath
+      ? `${description}\n\nUploaded screenshot: ${screenshotPath}`
+      : description;
+
+    const id = randomUUID();
+    await insertTask({ id, question, connectionId });
+    void runTask(id, { manualAssist, screenshotFilePath: req.file?.path, apiKey, llmProvider, startUrlHint });
+
+    res.status(202).json({
+      id,
+      status: "queued",
+      screenshotPath,
+      manualAssist,
+      statusUrl: `/tasks/${id}`
+    });
+  } catch (error) {
+    const status =
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      typeof (error as { status: unknown }).status === "number"
+        ? (error as { status: number }).status
+        : 500;
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(status).json({ error: message });
   }
-  const { apiKey, llmProvider } = resolved;
-  const connectionId =
-    req.body?.connectionId === null ||
-    req.body?.connectionId === undefined ||
-    String(req.body?.connectionId).trim() === ""
-      ? null
-      : String(req.body.connectionId).trim();
-
-  if (!description) {
-    res.status(400).json({ error: "description is required." });
-    return;
-  }
-
-  const screenshotPath = req.file ? `/files/uploads/${req.file.filename}` : null;
-  const question = screenshotPath
-    ? `${description}\n\nUploaded screenshot: ${screenshotPath}`
-    : description;
-
-  const id = randomUUID();
-  await insertTask({ id, question, connectionId });
-  void runTask(id, { manualAssist, screenshotFilePath: req.file?.path, apiKey, llmProvider, startUrlHint });
-
-  res.status(202).json({
-    id,
-    status: "queued",
-    screenshotPath,
-    manualAssist,
-    statusUrl: `/tasks/${id}`
-  });
 });
 
 app.get("/tasks/:id", async (req, res) => {

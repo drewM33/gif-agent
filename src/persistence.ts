@@ -19,8 +19,30 @@ CREATE TABLE IF NOT EXISTS connections (
   domain TEXT NOT NULL,
   start_url TEXT NOT NULL,
   encrypted_state TEXT NOT NULL,
+  user_id TEXT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS connection_pairings (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS extension_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  token_id TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -94,6 +116,7 @@ export async function initDatabase(): Promise<void> {
       ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {})
     });
     await pgPool.query("SELECT 1");
+    await migratePostgresAuthTunnel(pgPool);
     return;
   }
 
@@ -103,11 +126,63 @@ export async function initDatabase(): Promise<void> {
   sqliteDb = new Database(dbPath);
   sqliteDb.pragma("journal_mode = WAL");
   sqliteDb.exec(SQLITE_SCHEMA);
+  migrateSqliteAuthTunnel(sqliteDb);
 
   const cols = sqliteDb.prepare("PRAGMA table_info(users)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "llm_provider")) {
     sqliteDb.exec("ALTER TABLE users ADD COLUMN llm_provider TEXT NOT NULL DEFAULT 'anthropic'");
   }
+}
+
+function migrateSqliteAuthTunnel(db: Database.Database): void {
+  const connCols = db.prepare("PRAGMA table_info(connections)").all() as { name: string }[];
+  if (!connCols.some((c) => c.name === "user_id")) {
+    db.exec("ALTER TABLE connections ADD COLUMN user_id TEXT NULL REFERENCES users(id)");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS connection_pairings (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS extension_tokens (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_id TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_connection_pairings_code_hash ON connection_pairings(code_hash);
+  `);
+}
+
+async function migratePostgresAuthTunnel(pool: Pool): Promise<void> {
+  await pool.query(`
+    ALTER TABLE connections ADD COLUMN IF NOT EXISTS user_id text NULL REFERENCES users(id) ON DELETE SET NULL;
+    CREATE TABLE IF NOT EXISTS connection_pairings (
+      id text PRIMARY KEY,
+      user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      code_hash text NOT NULL,
+      expires_at text NOT NULL,
+      consumed_at text NULL,
+      created_at text NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS extension_tokens (
+      id text PRIMARY KEY,
+      user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_id text NOT NULL UNIQUE,
+      expires_at text NOT NULL,
+      revoked_at text NULL,
+      created_at text NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_connection_pairings_code_hash ON connection_pairings(code_hash);
+  `);
 }
 
 function requireSqlite(): Database.Database {
@@ -123,6 +198,7 @@ function mapConnectionRow(row: {
   domain: string;
   start_url: string;
   encrypted_state: string;
+  user_id?: string | null;
   created_at: string;
   updated_at: string;
 }): ConnectionRecord {
@@ -133,7 +209,8 @@ function mapConnectionRow(row: {
     startUrl: row.start_url,
     encryptedState: row.encrypted_state,
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    userId: row.user_id ?? null
   };
 }
 
@@ -167,22 +244,24 @@ export async function insertConnection(input: {
   domain: string;
   startUrl: string;
   encryptedState: string;
+  userId?: string | null;
 }): Promise<void> {
   const now = new Date().toISOString();
+  const userId = input.userId ?? null;
   if (pgPool) {
     await pgPool.query(
-      `INSERT INTO connections (id, name, domain, start_url, encrypted_state, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-      [input.id, input.name, input.domain, input.startUrl, input.encryptedState, now]
+      `INSERT INTO connections (id, name, domain, start_url, encrypted_state, user_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
+      [input.id, input.name, input.domain, input.startUrl, input.encryptedState, userId, now]
     );
     return;
   }
   requireSqlite()
     .prepare(
-      `INSERT INTO connections (id, name, domain, start_url, encrypted_state, created_at, updated_at)
-       VALUES (@id, @name, @domain, @startUrl, @encryptedState, @now, @now)`
+      `INSERT INTO connections (id, name, domain, start_url, encrypted_state, user_id, created_at, updated_at)
+       VALUES (@id, @name, @domain, @startUrl, @encryptedState, @userId, @now, @now)`
     )
-    .run({ ...input, now });
+    .run({ ...input, userId, now });
 }
 
 export async function getConnection(id: string): Promise<ConnectionRecord | null> {
@@ -508,4 +587,158 @@ export async function selectUserEncryptedApiKey(userId: string): Promise<string 
     .prepare("SELECT encrypted_api_key FROM users WHERE id = ?")
     .get(userId) as { encrypted_api_key: string | null } | undefined;
   return row?.encrypted_api_key ?? null;
+}
+
+export async function listConnectionsByUserId(userId: string): Promise<ConnectionRecord[]> {
+  type Row = {
+    id: string;
+    name: string;
+    domain: string;
+    start_url: string;
+    encrypted_state: string;
+    user_id?: string | null;
+    created_at: string;
+    updated_at: string;
+  };
+  if (pgPool) {
+    const { rows } = await pgPool.query(
+      `SELECT * FROM connections WHERE user_id = $1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    return (rows as Row[]).map(mapConnectionRow);
+  }
+  const rows = requireSqlite()
+    .prepare("SELECT * FROM connections WHERE user_id = ? ORDER BY created_at DESC")
+    .all(userId) as Row[];
+  return rows.map(mapConnectionRow);
+}
+
+export async function insertConnectionPairing(input: {
+  id: string;
+  userId: string;
+  codeHash: string;
+  expiresAt: string;
+  createdAt: string;
+}): Promise<void> {
+  if (pgPool) {
+    await pgPool.query(
+      `INSERT INTO connection_pairings (id, user_id, code_hash, expires_at, consumed_at, created_at)
+       VALUES ($1, $2, $3, $4, NULL, $5)`,
+      [input.id, input.userId, input.codeHash, input.expiresAt, input.createdAt]
+    );
+    return;
+  }
+  requireSqlite()
+    .prepare(
+      `INSERT INTO connection_pairings (id, user_id, code_hash, expires_at, consumed_at, created_at)
+       VALUES (?, ?, ?, ?, NULL, ?)`
+    )
+    .run(input.id, input.userId, input.codeHash, input.expiresAt, input.createdAt);
+}
+
+export async function findActivePairingByCodeHash(
+  codeHash: string,
+  nowIso: string
+): Promise<{ id: string; userId: string } | null> {
+  if (pgPool) {
+    const { rows } = await pgPool.query(
+      `SELECT id, user_id AS "userId"
+       FROM connection_pairings
+       WHERE code_hash = $1
+         AND consumed_at IS NULL
+         AND expires_at > $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [codeHash, nowIso]
+    );
+    return (rows[0] as { id: string; userId: string } | undefined) ?? null;
+  }
+  const row = requireSqlite()
+    .prepare(
+      `SELECT id, user_id AS userId
+       FROM connection_pairings
+       WHERE code_hash = ?
+         AND consumed_at IS NULL
+         AND expires_at > ?
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .get(codeHash, nowIso) as { id: string; userId: string } | undefined;
+  return row ?? null;
+}
+
+export async function consumePairing(id: string, consumedAt: string): Promise<void> {
+  if (pgPool) {
+    await pgPool.query("UPDATE connection_pairings SET consumed_at = $1 WHERE id = $2", [consumedAt, id]);
+    return;
+  }
+  requireSqlite().prepare("UPDATE connection_pairings SET consumed_at = ? WHERE id = ?").run(consumedAt, id);
+}
+
+export async function insertExtensionToken(input: {
+  id: string;
+  userId: string;
+  tokenId: string;
+  expiresAt: string;
+  createdAt: string;
+}): Promise<void> {
+  if (pgPool) {
+    await pgPool.query(
+      `INSERT INTO extension_tokens (id, user_id, token_id, expires_at, revoked_at, created_at)
+       VALUES ($1, $2, $3, $4, NULL, $5)`,
+      [input.id, input.userId, input.tokenId, input.expiresAt, input.createdAt]
+    );
+    return;
+  }
+  requireSqlite()
+    .prepare(
+      `INSERT INTO extension_tokens (id, user_id, token_id, expires_at, revoked_at, created_at)
+       VALUES (?, ?, ?, ?, NULL, ?)`
+    )
+    .run(input.id, input.userId, input.tokenId, input.expiresAt, input.createdAt);
+}
+
+export type ExtensionTokenRow = {
+  id: string;
+  userId: string;
+  tokenId: string;
+  expiresAt: string;
+  revokedAt: string | null;
+};
+
+export async function getExtensionTokenRow(tokenId: string, nowIso: string): Promise<ExtensionTokenRow | null> {
+  if (pgPool) {
+    const { rows } = await pgPool.query(
+      `SELECT id, user_id AS "userId", token_id AS "tokenId", expires_at AS "expiresAt", revoked_at AS "revokedAt"
+       FROM extension_tokens
+       WHERE token_id = $1
+         AND revoked_at IS NULL
+         AND expires_at > $2`,
+      [tokenId, nowIso]
+    );
+    return (rows[0] as ExtensionTokenRow | undefined) ?? null;
+  }
+  const row = requireSqlite()
+    .prepare(
+      `SELECT id, user_id AS userId, token_id AS tokenId, expires_at AS expiresAt, revoked_at AS revokedAt
+       FROM extension_tokens
+       WHERE token_id = ?
+         AND revoked_at IS NULL
+         AND expires_at > ?`
+    )
+    .get(tokenId, nowIso) as ExtensionTokenRow | undefined;
+  return row ?? null;
+}
+
+export async function revokeExtensionTokensForUserId(userId: string, revokedAt: string): Promise<void> {
+  if (pgPool) {
+    await pgPool.query(
+      "UPDATE extension_tokens SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL",
+      [revokedAt, userId]
+    );
+    return;
+  }
+  requireSqlite()
+    .prepare("UPDATE extension_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+    .run(revokedAt, userId);
 }

@@ -6,6 +6,8 @@ export type ConnectionRecord = {
   encryptedState: string;
   createdAt: string;
   updatedAt: string;
+  /** Owner when created via extension/import; null for legacy rows. */
+  userId: string | null;
 };
 
 export type TaskStatus = "queued" | "running" | "done" | "error";

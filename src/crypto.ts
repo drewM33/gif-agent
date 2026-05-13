@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 function decodeMasterKey(input: string): Buffer {
   const base64 = Buffer.from(input, "base64");
@@ -46,4 +46,10 @@ export function decryptText(cipherText: string): string {
   ]);
 
   return plain.toString("utf8");
+}
+
+/** Deterministic key for signing browser-extension tunnel tokens (HMAC). */
+export function deriveExtensionTokenSigningKey(): Buffer {
+  const key = getMasterKey();
+  return createHash("sha256").update(key).update("gif-agent-extension-token-v1").digest();
 }

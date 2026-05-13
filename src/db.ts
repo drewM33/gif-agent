@@ -3,8 +3,10 @@ export {
   usePostgres,
   insertConnection,
   getConnection,
+  listConnectionsByUserId,
   insertTask,
   updateTask,
   getTask,
-  setTaskStatus
+  setTaskStatus,
+  revokeExtensionTokensForUserId
 } from "./persistence";

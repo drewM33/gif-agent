@@ -18,12 +18,16 @@ You also need `ffmpeg` on your `PATH`.
 ## Database (SQLite vs Supabase / Postgres)
 
 - **Default:** SQLite file at `DATA_DIR/gif-agent.sqlite` (same as before).
-- **Supabase / Postgres:** Set `DATABASE_URL` (or `SUPABASE_DATABASE_URL`) to your Postgres connection string, run the SQL in `supabase/migrations/20250509140000_gif_agent_core.sql` once (Supabase **SQL Editor** or `supabase db reset`), then start the app. See `supabase/README.md` for step-by-step setup.
+- **Supabase / Postgres:** Set `DATABASE_URL` (or `SUPABASE_DATABASE_URL`) to your Postgres connection string, run the SQL in `supabase/migrations/20250509140000_gif_agent_core.sql` and `supabase/migrations/20260513000000_auth_tunnel.sql` once (Supabase **SQL Editor** or `supabase db reset`), then start the app. See `supabase/README.md` for step-by-step setup.
 
 ## API
 
-- `POST /connections/login` with `{ name, startUrl }`
+- `POST /connections/login` with `{ name, startUrl }` (requires `ENABLE_HEADFUL_BROWSER=true`; use the Chrome extension on hosted backends)
 - `POST /connections/login/:loginId/finish`
+- `GET /connections` (signed-in user; lists connections imported for your account)
+- `POST /connections/pair/start` — returns `{ code, expiresInSec }` (requires session cookie)
+- `POST /connections/pair/exchange` with `{ code }` — returns `{ extensionToken }` (for the extension)
+- `POST /connections/import` with `{ name, startUrl, storageState, extraHosts? }` — Bearer extension token **or** session cookie; returns `{ connectionId }`
 - `POST /tasks` with `{ question, connectionId?, apiKey?, llmProvider?, manualAssist? }` — `llmProvider` is `anthropic` (default) or `openai`
 - `POST /ui/tasks` multipart with `description`, optional `screenshot`, optional `connectionId`, optional `apiKey`, optional `llmProvider`, optional `manualAssist`
 - `POST /auth/request-link` with `{ email }`
@@ -41,6 +45,7 @@ Open `http://localhost:3000` and use the built-in UI to:
 - Drag-and-drop or upload a screenshot.
 - Enter a description of the problem.
 - Sign in/create account with magic link email and save BYOK (toggle Claude/Anthropic vs ChatGPT/OpenAI for which API key you use).
+- For authenticated sites: load the Chrome extension from `extension/` (Chrome → Extensions → Load unpacked), generate a pairing code in the UI, paste it in the extension, then capture while on the logged-in tab.
 - Generate and preview a walkthrough GIF that shows a cursor-guided browser flow.
 
 ## Notes

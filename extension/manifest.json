@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "gif-agent session capture",
+  "version": "1.0.0",
+  "description": "Capture cookies and storage from your logged-in browser for gif-agent walkthroughs.",
+  "permissions": ["cookies", "storage", "activeTab", "scripting", "tabs"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gif-agent-frontend.vercel.app/*", "http://localhost:3000/*", "http://127.0.0.1:3000/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "gif-agent",
+    "default_popup": "popup.html"
+  }
+}

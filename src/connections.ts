@@ -25,6 +25,11 @@ export async function startConnectionLogin(input: {
   name: string;
   startUrl: string;
 }): Promise<{ loginId: string; message: string }> {
+  if (process.env.ENABLE_HEADFUL_BROWSER !== "true") {
+    throw new Error(
+      "Headed browser login is disabled on this server. Use the Chrome extension to capture your session, or set ENABLE_HEADFUL_BROWSER=true for local headed login."
+    );
+  }
   const loginId = randomUUID();
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext();

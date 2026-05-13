@@ -17,54 +17,78 @@ const MAX_REPAIR_CANDIDATES = 80;
 
 const CURSOR_ID = "__gif_agent_cursor";
 
+function isExecutionContextDestroyedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("Execution context was destroyed") ||
+    message.includes("Cannot find context with specified id")
+  );
+}
+
+async function retryAfterNavigation(page: Page, run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    if (!isExecutionContextDestroyedError(error)) {
+      throw error;
+    }
+    await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => undefined);
+    await run();
+  }
+}
+
 async function ensureCursor(page: Page): Promise<void> {
-  await page.evaluate((cursorId) => {
-    if (document.getElementById(cursorId)) return;
-    const parent = document.body ?? document.documentElement;
-    if (!parent) return;
-    const cursor = document.createElement("div");
-    cursor.id = cursorId;
-    Object.assign(cursor.style, {
-      position: "fixed",
-      width: "34px",
-      height: "34px",
-      borderRadius: "999px 999px 999px 6px",
-      background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
-      border: "3px solid rgba(255,255,255,0.95)",
-      boxShadow: "0 6px 18px rgba(0,0,0,0.45), 0 0 0 4px rgba(139,92,246,0.25)",
-      zIndex: "2147483647",
-      pointerEvents: "none",
-      left: "20px",
-      top: "20px",
-      transform: "translate(-50%, -50%) rotate(-45deg)",
-      transition: "left 0.35s ease, top 0.35s ease"
-    } as Partial<CSSStyleDeclaration>);
-    const shine = document.createElement("div");
-    Object.assign(shine.style, {
-      position: "absolute",
-      width: "9px",
-      height: "9px",
-      borderRadius: "999px",
-      background: "rgba(255,255,255,0.85)",
-      left: "8px",
-      top: "7px"
-    } as Partial<CSSStyleDeclaration>);
-    cursor.appendChild(shine);
-    parent.appendChild(cursor);
-  }, CURSOR_ID);
+  await retryAfterNavigation(page, async () => {
+    await page.evaluate((cursorId) => {
+      if (document.getElementById(cursorId)) return;
+      const parent = document.body ?? document.documentElement;
+      if (!parent) return;
+      const cursor = document.createElement("div");
+      cursor.id = cursorId;
+      Object.assign(cursor.style, {
+        position: "fixed",
+        width: "34px",
+        height: "34px",
+        borderRadius: "999px 999px 999px 6px",
+        background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
+        border: "3px solid rgba(255,255,255,0.95)",
+        boxShadow: "0 6px 18px rgba(0,0,0,0.45), 0 0 0 4px rgba(139,92,246,0.25)",
+        zIndex: "2147483647",
+        pointerEvents: "none",
+        left: "20px",
+        top: "20px",
+        transform: "translate(-50%, -50%) rotate(-45deg)",
+        transition: "left 0.35s ease, top 0.35s ease"
+      } as Partial<CSSStyleDeclaration>);
+      const shine = document.createElement("div");
+      Object.assign(shine.style, {
+        position: "absolute",
+        width: "9px",
+        height: "9px",
+        borderRadius: "999px",
+        background: "rgba(255,255,255,0.85)",
+        left: "8px",
+        top: "7px"
+      } as Partial<CSSStyleDeclaration>);
+      cursor.appendChild(shine);
+      parent.appendChild(cursor);
+    }, CURSOR_ID);
+  });
 }
 
 async function moveCursor(page: Page, x: number, y: number): Promise<void> {
   await ensureCursor(page);
-  await page.evaluate(
-    ({ cursorId, xPos, yPos }) => {
-      const cursor = document.getElementById(cursorId);
-      if (!cursor) return;
-      cursor.style.left = `${xPos}px`;
-      cursor.style.top = `${yPos}px`;
-    },
-    { cursorId: CURSOR_ID, xPos: x, yPos: y }
-  );
+  await retryAfterNavigation(page, async () => {
+    await page.evaluate(
+      ({ cursorId, xPos, yPos }) => {
+        const cursor = document.getElementById(cursorId);
+        if (!cursor) return;
+        cursor.style.left = `${xPos}px`;
+        cursor.style.top = `${yPos}px`;
+      },
+      { cursorId: CURSOR_ID, xPos: x, yPos: y }
+    );
+  });
   await page.waitForTimeout(360);
 }
 
@@ -414,7 +438,9 @@ async function applyCaption(page: Page, caption: string): Promise<void> {
     el.textContent = text;
   };
 
-  await page.evaluate(fn, caption);
+  await retryAfterNavigation(page, async () => {
+    await page.evaluate(fn, caption);
+  });
 }
 
 async function notifyCaptchaNeeded(page: Page): Promise<void> {
@@ -489,6 +515,34 @@ async function maybeHandleCaptcha(page: Page, manualAssist: boolean): Promise<vo
 
 function shouldBlockClick(step: Extract<PlanStep, { action: "click" }>): boolean {
   return BLOCKED_CLICK_TEXT.test(step.selector);
+}
+
+function isPointerInterceptClickError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("intercepts pointer events") || message.includes("element receives pointer events");
+}
+
+async function clickLocator(locator: Locator): Promise<"pointer" | "dom"> {
+  try {
+    await locator.click({ timeout: 8_000 });
+    return "pointer";
+  } catch (error) {
+    if (!isPointerInterceptClickError(error)) {
+      throw error;
+    }
+
+    // Some apps render transient glass panes above visible controls. If Playwright
+    // resolved a visible target but hit-testing is blocked, invoke the element's
+    // own click handler instead of clicking the overlay.
+    await locator.evaluate((node) => {
+      if (node instanceof HTMLElement) {
+        node.click();
+        return;
+      }
+      node.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    });
+    return "dom";
+  }
 }
 
 function canRunHeadedBrowser(): boolean {
@@ -580,18 +634,21 @@ export async function executePlan(input: {
         {
           const locator = await requireVisibleLocator(page, step, "click", input.selectorRepair ?? {});
           await moveCursorToLocator(locator);
-        if (shouldBlockClick(step)) {
-          await locator.hover();
-          await applyCaption(
-            page,
-            step.caption ?? `Blocked potentially destructive click: ${step.selector}`
-          );
-          await page.waitForTimeout(900);
-        } else {
-          await locator.click({ timeout: 8_000 });
-          await applyCaption(page, step.caption ?? `Click ${step.selector}`);
-          await page.waitForTimeout(900);
-        }
+          if (shouldBlockClick(step)) {
+            await locator.hover();
+            await applyCaption(
+              page,
+              step.caption ?? `Blocked potentially destructive click: ${step.selector}`
+            );
+            await page.waitForTimeout(900);
+          } else {
+            const method = await clickLocator(locator);
+            await applyCaption(
+              page,
+              step.caption ?? (method === "dom" ? `Click ${step.selector} (overlay bypass)` : `Click ${step.selector}`)
+            );
+            await page.waitForTimeout(900);
+          }
         }
         break;
       default:

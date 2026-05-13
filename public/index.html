@@ -393,6 +393,17 @@
               <span class="small muted">Be specific for better walkthroughs</span>
             </div>
             <input id="connectionId" placeholder="Optional connectionId (authenticated sites)" />
+            <div class="small muted" style="margin-top: 8px">
+              <strong>Extension capture:</strong> sign in, then generate a pairing code and paste it into the
+              <code>extension/</code> Chrome extension (Load unpacked). When capture succeeds, this field updates
+              automatically.
+            </div>
+            <div class="row" style="margin-top: 8px; gap: 8px; flex-wrap: wrap; align-items: center">
+              <button id="pairStartBtn" type="button" class="button-secondary">Generate pairing code</button>
+              <span id="pairCodeDisplay" class="small" style="font-family: ui-monospace, monospace"></span>
+              <span id="pairCountdown" class="small muted"></span>
+            </div>
+            <div id="pairHint" class="small muted" style="margin-top: 4px"></div>
             <div class="section-title" style="margin-top: 4px">API provider (BYOK)</div>
             <div class="llm-toggle" role="group" aria-label="LLM provider">
               <button type="button" id="llmAnthropic">Claude (Anthropic)</button>
@@ -462,6 +473,10 @@
       const description = document.getElementById("description");
       const charCount = document.getElementById("charCount");
       const connectionId = document.getElementById("connectionId");
+      const pairStartBtn = document.getElementById("pairStartBtn");
+      const pairCodeDisplay = document.getElementById("pairCodeDisplay");
+      const pairCountdown = document.getElementById("pairCountdown");
+      const pairHint = document.getElementById("pairHint");
       const apiKey = document.getElementById("apiKey");
       const llmAnthropic = document.getElementById("llmAnthropic");
       const llmOpenai = document.getElementById("llmOpenai");
@@ -577,6 +592,141 @@
         }
         return apiUrl(path);
       }
+
+      let pairingPollTimer = null;
+      let connectionIdsBeforePair = new Set();
+      let autoPairAbort = null;
+
+      async function fetchConnectionsList() {
+        const response = await fetch(apiUrl("/connections"), { credentials: "include" });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return Array.isArray(data.connections) ? data.connections : [];
+      }
+
+      function stopPairingPoll() {
+        if (pairingPollTimer) {
+          clearInterval(pairingPollTimer);
+          pairingPollTimer = null;
+        }
+      }
+
+      function autoPairWithExtension({ code, apiBaseUrl }) {
+        if (!code || !apiBaseUrl) {
+          return Promise.resolve({ ok: false, error: "Missing code or API base URL." });
+        }
+        if (autoPairAbort) {
+          autoPairAbort.abort();
+        }
+        autoPairAbort = new AbortController();
+        const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+        return new Promise((resolve) => {
+          const timeout = window.setTimeout(() => {
+            cleanup();
+            resolve({
+              ok: false,
+              error: "Auto-pair handshake timed out. Open the extension popup and paste the code manually."
+            });
+          }, 2500);
+
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", onMessage);
+            autoPairAbort = null;
+          };
+
+          const onMessage = (event) => {
+            if (event.source !== window) return;
+            const msg = event.data;
+            if (!msg || msg.type !== "gif_agent_auto_pair_response" || msg.requestId !== requestId) return;
+            cleanup();
+            resolve({ ok: Boolean(msg.ok), error: msg.error || null });
+          };
+
+          window.addEventListener("message", onMessage, { signal: autoPairAbort.signal });
+          window.postMessage(
+            {
+              type: "gif_agent_auto_pair_request",
+              requestId,
+              payload: { code, apiBaseUrl }
+            },
+            "*"
+          );
+        });
+      }
+
+      pairStartBtn.addEventListener("click", async () => {
+        if (!authUser) {
+          setStatus("Sign in first to generate a pairing code.", "error");
+          setAuthMenuOpen(true);
+          return;
+        }
+        pairStartBtn.disabled = true;
+        pairHint.textContent = "";
+        pairCodeDisplay.textContent = "";
+        pairCountdown.textContent = "";
+        stopPairingPoll();
+        let tick = null;
+        try {
+          const existing = await fetchConnectionsList();
+          connectionIdsBeforePair = new Set(existing.map((c) => c.id));
+          const response = await fetch(apiUrl("/connections/pair/start"), {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({})
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data.error || "Failed to start pairing.");
+          }
+          const code = data.code;
+          const sec = Number(data.expiresInSec) || 300;
+          pairCodeDisplay.textContent = code;
+          pairHint.textContent =
+            "Paste this code into the gif-agent Chrome extension (Load unpacked from the repo extension folder). Use the same API base URL as this page, then capture on your logged-in tab.";
+          const autoPair = await autoPairWithExtension({ code, apiBaseUrl: API_BASE_URL });
+          if (autoPair.ok) {
+            pairHint.textContent =
+              "Paired automatically with your extension. Open a logged-in tab in Chrome and click Capture this tab in the extension.";
+          } else if (autoPair.error) {
+            pairHint.textContent = `${pairHint.textContent} Auto-pair note: ${autoPair.error}`;
+          }
+          let left = sec;
+          pairCountdown.textContent = `expires in ${left}s`;
+          tick = setInterval(() => {
+            left -= 1;
+            pairCountdown.textContent = left > 0 ? `expires in ${left}s` : "expired";
+            if (left <= 0) {
+              clearInterval(tick);
+              tick = null;
+              stopPairingPoll();
+            }
+          }, 1000);
+          pairingPollTimer = setInterval(async () => {
+            try {
+              const list = await fetchConnectionsList();
+              const newest = list
+                .filter((c) => !connectionIdsBeforePair.has(c.id))
+                .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+              if (newest?.id) {
+                connectionId.value = newest.id;
+                pairHint.textContent = `Imported connection selected: ${newest.name} (${newest.id.slice(0, 8)}…)`;
+                stopPairingPoll();
+                if (tick) clearInterval(tick);
+                pairCountdown.textContent = "";
+              }
+            } catch {
+              /* ignore */
+            }
+          }, 2000);
+        } catch (error) {
+          pairHint.textContent = error instanceof Error ? error.message : "Pairing failed.";
+        } finally {
+          pairStartBtn.disabled = false;
+        }
+      });
 
       async function refreshAuthState() {
         try {
