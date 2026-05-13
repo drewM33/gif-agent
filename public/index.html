@@ -394,10 +394,15 @@
             </div>
             <input id="connectionId" placeholder="Optional connectionId (authenticated sites)" />
             <div class="small muted" style="margin-top: 8px">
-              <strong>Extension capture:</strong> sign in, then generate a pairing code and paste it into the
-              <code>extension/</code> Chrome extension (Load unpacked). When capture succeeds, this field updates
-              automatically.
+              <strong>Extension capture:</strong> sign in, then click <em>Generate pairing code</em>. If the gif-agent
+              Chrome extension is installed, it auto-pairs and auto-captures the most-recently-active logged-in tab
+              (or the target URL below) — this field updates automatically.
             </div>
+            <input
+              id="pairTargetUrl"
+              placeholder="Target site URL (optional, e.g. https://accounts.google.com/)"
+              style="margin-top: 8px"
+            />
             <div class="row" style="margin-top: 8px; gap: 8px; flex-wrap: wrap; align-items: center">
               <button id="pairStartBtn" type="button" class="button-secondary">Generate pairing code</button>
               <span id="pairCodeDisplay" class="small" style="font-family: ui-monospace, monospace"></span>
@@ -477,6 +482,7 @@
       const pairCodeDisplay = document.getElementById("pairCodeDisplay");
       const pairCountdown = document.getElementById("pairCountdown");
       const pairHint = document.getElementById("pairHint");
+      const pairTargetUrl = document.getElementById("pairTargetUrl");
       const apiKey = document.getElementById("apiKey");
       const llmAnthropic = document.getElementById("llmAnthropic");
       const llmOpenai = document.getElementById("llmOpenai");
@@ -611,7 +617,7 @@
         }
       }
 
-      function autoPairWithExtension({ code, apiBaseUrl }) {
+      function autoPairWithExtension({ code, apiBaseUrl, targetUrl, name }) {
         if (!code || !apiBaseUrl) {
           return Promise.resolve({ ok: false, error: "Missing code or API base URL." });
         }
@@ -628,7 +634,7 @@
               ok: false,
               error: "Auto-pair handshake timed out. Open the extension popup and paste the code manually."
             });
-          }, 2500);
+          }, 12000);
 
           const cleanup = () => {
             window.clearTimeout(timeout);
@@ -641,7 +647,11 @@
             const msg = event.data;
             if (!msg || msg.type !== "gif_agent_auto_pair_response" || msg.requestId !== requestId) return;
             cleanup();
-            resolve({ ok: Boolean(msg.ok), error: msg.error || null });
+            resolve({
+              ok: Boolean(msg.ok),
+              error: msg.error || null,
+              capture: msg.capture || null
+            });
           };
 
           window.addEventListener("message", onMessage, { signal: autoPairAbort.signal });
@@ -649,7 +659,7 @@
             {
               type: "gif_agent_auto_pair_request",
               requestId,
-              payload: { code, apiBaseUrl }
+              payload: { code, apiBaseUrl, targetUrl: targetUrl || "", name: name || "" }
             },
             "*"
           );
@@ -686,10 +696,32 @@
           pairCodeDisplay.textContent = code;
           pairHint.textContent =
             "Paste this code into the gif-agent Chrome extension (Load unpacked from the repo extension folder). Use the same API base URL as this page, then capture on your logged-in tab.";
-          const autoPair = await autoPairWithExtension({ code, apiBaseUrl: API_BASE_URL });
+          const targetUrlValue = (pairTargetUrl?.value || "").trim();
+          const autoPair = await autoPairWithExtension({
+            code,
+            apiBaseUrl: API_BASE_URL,
+            targetUrl: targetUrlValue,
+            name: ""
+          });
           if (autoPair.ok) {
-            pairHint.textContent =
-              "Paired automatically with your extension. Open a logged-in tab in Chrome and click Capture this tab in the extension.";
+            const cap = autoPair.capture;
+            if (cap?.captured && cap.connectionId) {
+              connectionId.value = cap.connectionId;
+              const host = (() => {
+                try {
+                  return new URL(cap.targetUrl).hostname;
+                } catch {
+                  return cap.targetUrl || "target site";
+                }
+              })();
+              pairHint.textContent = `Auto-paired and captured session for ${host}. connectionId selected.`;
+              stopPairingPoll();
+            } else if (cap && !cap.captured) {
+              pairHint.textContent = `Auto-paired with extension. Auto-capture skipped: ${cap.reason || "no target tab found"}. Open a logged-in tab and click Capture this tab in the extension, or set Target site URL and re-generate.`;
+            } else {
+              pairHint.textContent =
+                "Paired automatically with your extension. Open a logged-in tab in Chrome and click Capture this tab in the extension.";
+            }
           } else if (autoPair.error) {
             pairHint.textContent = `${pairHint.textContent} Auto-pair note: ${autoPair.error}`;
           }

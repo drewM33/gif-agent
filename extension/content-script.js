@@ -20,7 +20,8 @@ window.addEventListener("message", (event) => {
           type: "gif_agent_auto_pair_response",
           requestId,
           ok: Boolean(response?.ok) && !runtimeError,
-          error: runtimeError || response?.error || null
+          error: runtimeError || response?.error || null,
+          capture: response?.capture || null
         },
         "*"
       );
