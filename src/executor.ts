@@ -310,24 +310,45 @@ async function repairVisibleLocator(
   step: Extract<PlanStep, { selector: string }>,
   action: string,
   options: SelectorRepairOptions
-): Promise<Locator | null> {
+): Promise<{ locator: Locator | null; reason: string }> {
   const provider = options.llmProvider ?? "anthropic";
   const apiKey =
     options.apiKey?.trim() ||
     (provider === "openai" ? process.env.OPENAI_API_KEY?.trim() : process.env.ANTHROPIC_API_KEY?.trim());
-  if (!apiKey) return null;
+  if (!apiKey) {
+    console.warn(`[selector-repair] no api key for provider=${provider}; skipping vision repair.`);
+    return { locator: null, reason: "no api key" };
+  }
 
   const candidates = await collectRepairCandidates(page);
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    console.warn("[selector-repair] no visible candidates collected from page");
+    return { locator: null, reason: "no candidates" };
+  }
 
-  const index =
-    provider === "openai"
-      ? await repairSelectorWithOpenAI(page, step, action, candidates, apiKey, options.taskGoal)
-      : await repairSelectorWithAnthropic(page, step, action, candidates, apiKey, options.taskGoal);
-  if (index === null) return null;
+  let index: number | null = null;
+  try {
+    index =
+      provider === "openai"
+        ? await repairSelectorWithOpenAI(page, step, action, candidates, apiKey, options.taskGoal)
+        : await repairSelectorWithAnthropic(page, step, action, candidates, apiKey, options.taskGoal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[selector-repair] vision call failed (${provider}): ${message}`);
+    return { locator: null, reason: `vision call failed: ${message}` };
+  }
+  if (index === null) {
+    console.warn("[selector-repair] vision did not return a confident candidate");
+    return { locator: null, reason: "no confident candidate" };
+  }
 
   const locator = page.locator(`[data-gif-agent-candidate="${index}"]`).first();
-  return (await locator.isVisible().catch(() => false)) ? locator : null;
+  if (!(await locator.isVisible().catch(() => false))) {
+    console.warn(`[selector-repair] chosen candidate index=${index} is no longer visible`);
+    return { locator: null, reason: "chosen candidate not visible" };
+  }
+  console.warn(`[selector-repair] vision selected candidate index=${index} for action=${action}`);
+  return { locator, reason: `vision picked index=${index}` };
 }
 
 async function requireVisibleLocator(
@@ -336,11 +357,13 @@ async function requireVisibleLocator(
   action: string,
   options: SelectorRepairOptions
 ): Promise<Locator> {
-  const locator = (await firstVisibleLocator(page, step.selector)) ?? (await repairVisibleLocator(page, step, action, options));
-  if (!locator) {
-    throw new Error(`Could not ${action}: no visible element matched ${step.selector}`);
-  }
-  return locator;
+  const direct = await firstVisibleLocator(page, step.selector);
+  if (direct) return direct;
+  const repair = await repairVisibleLocator(page, step, action, options);
+  if (repair.locator) return repair.locator;
+  throw new Error(
+    `Could not ${action}: no visible element matched ${step.selector} (repair: ${repair.reason})`
+  );
 }
 
 async function optionalVisibleLocator(
@@ -349,8 +372,10 @@ async function optionalVisibleLocator(
   action: string,
   options: SelectorRepairOptions
 ): Promise<Locator | null> {
-  const locator = await firstVisibleLocator(page, step.selector);
-  return locator ?? repairVisibleLocator(page, step, action, options);
+  const direct = await firstVisibleLocator(page, step.selector);
+  if (direct) return direct;
+  const repair = await repairVisibleLocator(page, step, action, options);
+  return repair.locator;
 }
 
 async function moveCursorToLocator(locator: Locator): Promise<void> {
