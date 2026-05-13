@@ -75,6 +75,7 @@ function selectorCandidates(selector: string): string[] {
     normalized.includes("sign in");
   const predictionMarketsLike =
     normalized.includes("prediction-markets") || normalized.includes("predictionmarkets");
+  const composeLike = normalized.includes("compose");
 
   if (normalized === "input[name='q']" || normalized === 'input[name="q"]') {
     candidates.push(
@@ -103,6 +104,21 @@ function selectorCandidates(selector: string): string[] {
       'a:has-text("Prediction Markets")',
       'button:has-text("Prediction Markets")',
       'text=Prediction Markets'
+    );
+  }
+
+  if (composeLike) {
+    candidates.push(
+      '[aria-label*="Compose" i]',
+      '[role="button"][aria-label*="Compose" i]',
+      'div[role="button"][aria-label*="Compose" i]',
+      'a[role="button"][aria-label*="Compose" i]',
+      'button[aria-label*="Compose" i]',
+      '[role="button"]:has-text("Compose")',
+      'div:has-text("Compose")',
+      'a:has-text("Compose")',
+      'button:has-text("Compose")',
+      'text=Compose'
     );
   }
 
