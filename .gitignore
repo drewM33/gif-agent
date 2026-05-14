@@ -12,3 +12,5 @@ supabase/.temp/
 .DS_Store
 npm-debug.log*
 .vercel
+
+demo-hn-screenshot.png
