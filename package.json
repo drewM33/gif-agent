@@ -12,7 +12,8 @@
     "test": "echo \"No tests yet\"",
     "demo:screenshot": "npx playwright screenshot https://news.ycombinator.com/ demo-hn-screenshot.png --timeout 60000",
     "demo:next-step": "npm run build && node scripts/next-step-from-screenshot.cjs",
-    "demo:next-step:fixture": "node scripts/next-step-from-screenshot.cjs --fixture"
+    "demo:next-step:fixture": "node scripts/next-step-from-screenshot.cjs --fixture",
+    "demo:gif": "npm run build && node scripts/render-demo-gif.cjs"
   },
   "keywords": [],
   "author": "",
