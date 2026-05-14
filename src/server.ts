@@ -228,8 +228,8 @@ app.get("/auth/verify", async (req, res) => {
 
 app.get("/extension/version", (_req, res) => {
   res.json({
-    version: process.env.EXTENSION_VERSION ?? "1.1.0",
-    minSupportedVersion: "1.1.0",
+    version: process.env.EXTENSION_VERSION ?? "1.2.0",
+    minSupportedVersion: "1.2.0",
     reloadHint: "If your installed version is below minSupportedVersion, call chrome.runtime.reload()."
   });
 });

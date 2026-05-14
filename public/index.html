@@ -678,6 +678,95 @@
         });
       }
 
+      function attentionHandoffWithExtension({ code, apiBaseUrl, targetUrl, name }) {
+        if (!code || !apiBaseUrl || !targetUrl) {
+          return Promise.resolve({ ok: false, error: "Missing code, API base URL, or target URL." });
+        }
+        const requestId = `attention_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        return new Promise((resolve) => {
+          const timeout = window.setTimeout(() => {
+            cleanup();
+            resolve({
+              ok: false,
+              error: "Extension attention handoff timed out. Opening the target site directly."
+            });
+          }, 12000);
+
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", onMessage);
+          };
+
+          const onMessage = (event) => {
+            if (event.source !== window) return;
+            const msg = event.data;
+            if (!msg || msg.type !== "gif_agent_attention_response" || msg.requestId !== requestId) return;
+            cleanup();
+            resolve({
+              ok: Boolean(msg.ok),
+              error: msg.error || null,
+              opened: Boolean(msg.opened),
+              monitoring: Boolean(msg.monitoring)
+            });
+          };
+
+          window.addEventListener("message", onMessage);
+          window.postMessage(
+            {
+              type: "gif_agent_attention_request",
+              requestId,
+              payload: { code, apiBaseUrl, targetUrl, name: name || "" }
+            },
+            "*"
+          );
+        });
+      }
+
+      async function startAttentionHandoff(targetUrl) {
+        if (!authUser || !targetUrl) {
+          return { ok: false, error: "Sign in to gif-agent before extension-assisted captcha handoff." };
+        }
+        stopPairingPoll();
+        const existing = await fetchConnectionsList();
+        connectionIdsBeforePair = new Set(existing.map((c) => c.id));
+        const response = await fetch(apiUrl("/connections/pair/start"), {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({})
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return { ok: false, error: data.error || "Failed to start extension handoff." };
+        }
+
+        const handoff = await attentionHandoffWithExtension({
+          code: data.code,
+          apiBaseUrl: API_BASE_URL,
+          targetUrl,
+          name: ""
+        });
+        if (handoff.ok) {
+          pairingPollTimer = setInterval(async () => {
+            try {
+              const list = await fetchConnectionsList();
+              const newest = list
+                .filter((c) => !connectionIdsBeforePair.has(c.id))
+                .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+              if (newest?.id) {
+                connectionId.value = newest.id;
+                pairHint.textContent = `Captured refreshed session: ${newest.name} (${newest.id.slice(0, 8)}…). Re-run to use it.`;
+                setStatus("Session captured. Re-run the walkthrough to use the refreshed login.", "done");
+                stopPairingPoll();
+              }
+            } catch {
+              /* ignore transient polling failures */
+            }
+          }, 3000);
+        }
+        return handoff;
+      }
+
       const KNOWN_TARGETS = [
         { keys: ["x.com", "twitter", "tweet", "retweet", "post on x"], url: "https://x.com/" },
         { keys: ["gmail", "google mail", "compose email", "send email"], url: "https://mail.google.com/" },
@@ -1078,7 +1167,24 @@
         const message = `Captcha detected on ${targetHost}. Please solve it now, then return to gif-agent and re-run.`;
         setStatus(message, "action");
         pairHint.textContent =
-          "Action needed: solve the captcha in your browser. After it clears, the extension can capture the refreshed session and the next run can reuse it.";
+          "Action needed: solve the captcha in your browser. If the extension is loaded, gif-agent will open/focus the target tab and auto-capture the refreshed session after it sees login cookies.";
+
+        let extensionOpened = false;
+        if (targetUrl) {
+          try {
+            const handoff = await startAttentionHandoff(targetUrl);
+            extensionOpened = Boolean(handoff.ok && handoff.opened);
+            if (handoff.ok) {
+              pairHint.textContent =
+                "Opened the target site in your local Chrome. Solve the captcha/login there; gif-agent will import the refreshed session automatically when auth cookies appear.";
+            } else if (handoff.error) {
+              pairHint.textContent = `${pairHint.textContent} Extension handoff note: ${handoff.error}`;
+            }
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            pairHint.textContent = `${pairHint.textContent} Extension handoff note: ${detail}`;
+          }
+        }
 
         if ("Notification" in window) {
           try {
@@ -1102,7 +1208,7 @@
           }
         }
 
-        if (targetUrl) {
+        if (targetUrl && !extensionOpened) {
           window.open(targetUrl, "_blank", "noopener");
         }
       }

@@ -1,6 +1,7 @@
 /* global chrome */
 
-const EXTENSION_VERSION = (chrome.runtime.getManifest?.()?.version) || "1.1.0";
+const EXTENSION_VERSION = (chrome.runtime.getManifest?.()?.version) || "1.2.0";
+const pendingAttentionCaptures = new Map();
 
 function compareSemver(a, b) {
   const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
@@ -270,14 +271,106 @@ async function autoCaptureForTarget({ apiBase, extensionToken, targetUrl, name }
   };
 }
 
+function hasLikelyAuthCookies(targetUrl, cookies) {
+  const host = safeHostname(targetUrl);
+  const names = new Set(cookies.map((c) => String(c.name || "").toLowerCase()));
+  if (host.endsWith("x.com") || host.endsWith("twitter.com")) {
+    return names.has("auth_token") && names.has("ct0");
+  }
+  if (host.endsWith("google.com")) {
+    return ["sid", "hsid", "ssid", "apisid", "sapisid", "__secure-1psid", "__secure-3psid"].some((n) =>
+      names.has(n)
+    );
+  }
+  if (host.endsWith("github.com")) {
+    return names.has("user_session") || names.has("dotcom_user");
+  }
+  return [...names].some((name) => /auth|session|token|sid|logged|login|user/i.test(name));
+}
+
+async function openOrFocusTargetTab(targetUrl) {
+  const existing = await findTabForTarget(targetUrl);
+  if (existing?.id) {
+    await chrome.tabs.update(existing.id, { active: true, url: existing.url || targetUrl });
+    if (existing.windowId !== undefined) {
+      await chrome.windows.update(existing.windowId, { focused: true }).catch(() => {});
+    }
+    return existing.id;
+  }
+  const created = await chrome.tabs.create({ url: targetUrl, active: true });
+  return created.id;
+}
+
+async function captureWhenLikelyAuthenticated({ apiBase, extensionToken, targetUrl, name, tabId }) {
+  const key = `${tabId || "any"}:${targetUrl}`;
+  const startedAt = Date.now();
+  pendingAttentionCaptures.set(key, true);
+
+  const attempt = async () => {
+    if (!pendingAttentionCaptures.has(key)) return;
+    const cookies = await collectCookiesForTarget(targetUrl);
+    if (!hasLikelyAuthCookies(targetUrl, cookies)) {
+      if (Date.now() - startedAt < 5 * 60 * 1000) {
+        setTimeout(attempt, 5000);
+      } else {
+        pendingAttentionCaptures.delete(key);
+      }
+      return;
+    }
+    const capture = await autoCaptureForTarget({ apiBase, extensionToken, targetUrl, name });
+    if (!capture?.captured && Date.now() - startedAt < 5 * 60 * 1000) {
+      setTimeout(attempt, 5000);
+      return;
+    }
+    pendingAttentionCaptures.delete(key);
+  };
+
+  setTimeout(attempt, 3000);
+}
+
+async function startAttentionHandoff(payload) {
+  let apiBase = normalizeBase(payload.apiBaseUrl);
+  let extensionToken = "";
+  if (payload.code) {
+    const exchanged = await exchangePairingCode(payload);
+    apiBase = exchanged.apiBase;
+    extensionToken = exchanged.extensionToken;
+  } else {
+    const stored = await chrome.storage.local.get(["apiBaseUrl", "extensionToken"]);
+    apiBase = apiBase || normalizeBase(stored?.apiBaseUrl);
+    extensionToken = stored?.extensionToken || "";
+  }
+
+  const targetUrl = String(payload.targetUrl || "").trim();
+  if (!apiBase) throw new Error("Missing API base URL.");
+  if (!extensionToken) throw new Error("Extension is not paired yet.");
+  if (!targetUrl) throw new Error("Missing target URL.");
+
+  const tabId = await openOrFocusTargetTab(targetUrl);
+  await captureWhenLikelyAuthenticated({
+    apiBase,
+    extensionToken,
+    targetUrl,
+    name: typeof payload.name === "string" ? payload.name.trim() : "",
+    tabId
+  });
+  return { ok: true, opened: true, monitoring: true };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.type !== "gif_agent_auto_pair") {
+  if (!message || (message.type !== "gif_agent_auto_pair" && message.type !== "gif_agent_attention")) {
     return undefined;
   }
 
   (async () => {
     try {
       const payload = message.payload || {};
+      if (message.type === "gif_agent_attention") {
+        const result = await startAttentionHandoff(payload);
+        sendResponse(result);
+        return;
+      }
+
       const { apiBase, extensionToken } = await exchangePairingCode(payload);
       checkForExtensionUpdate(apiBase).catch(() => {});
 
