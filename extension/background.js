@@ -1,5 +1,59 @@
 /* global chrome */
 
+const EXTENSION_VERSION = (chrome.runtime.getManifest?.()?.version) || "1.1.0";
+
+function compareSemver(a, b) {
+  const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i += 1) {
+    const ai = pa[i] ?? 0;
+    const bi = pb[i] ?? 0;
+    if (ai !== bi) return ai < bi ? -1 : 1;
+  }
+  return 0;
+}
+
+async function checkForExtensionUpdate(apiBaseUrl) {
+  const apiBase = normalizeBase(apiBaseUrl);
+  if (!apiBase) return;
+  try {
+    const res = await fetch(`${apiBase}/extension/version`, { method: "GET" });
+    if (!res.ok) return;
+    const data = await res.json().catch(() => ({}));
+    const minRequired = String(data?.minSupportedVersion || "").trim();
+    if (!minRequired) return;
+    if (compareSemver(EXTENSION_VERSION, minRequired) < 0) {
+      chrome.runtime.reload();
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function scheduleVersionCheck() {
+  try {
+    chrome.alarms?.create?.("gif-agent-version-check", { periodInMinutes: 60 });
+  } catch {
+    /* ignore */
+  }
+}
+
+chrome.runtime.onInstalled?.addListener?.(() => {
+  scheduleVersionCheck();
+});
+
+chrome.runtime.onStartup?.addListener?.(() => {
+  scheduleVersionCheck();
+});
+
+chrome.alarms?.onAlarm?.addListener?.(async (alarm) => {
+  if (alarm?.name !== "gif-agent-version-check") return;
+  const stored = await chrome.storage.local.get(["apiBaseUrl"]);
+  if (stored?.apiBaseUrl) {
+    await checkForExtensionUpdate(stored.apiBaseUrl);
+  }
+});
+
 function normalizeBase(url) {
   return String(url || "")
     .trim()
@@ -225,6 +279,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       const payload = message.payload || {};
       const { apiBase, extensionToken } = await exchangePairingCode(payload);
+      checkForExtensionUpdate(apiBase).catch(() => {});
 
       let targetUrl = typeof payload.targetUrl === "string" ? payload.targetUrl.trim() : "";
       let candidateTab = null;

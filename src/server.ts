@@ -226,6 +226,14 @@ app.get("/auth/verify", async (req, res) => {
   res.redirect(getFrontendOrigin() ?? "/");
 });
 
+app.get("/extension/version", (_req, res) => {
+  res.json({
+    version: process.env.EXTENSION_VERSION ?? "1.1.0",
+    minSupportedVersion: "1.1.0",
+    reloadHint: "If your installed version is below minSupportedVersion, call chrome.runtime.reload()."
+  });
+});
+
 app.get("/auth/me", async (req, res) => {
   const user = await getSessionUser(req.cookies?.gif_agent_session);
   res.json({

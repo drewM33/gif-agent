@@ -666,6 +666,68 @@
         });
       }
 
+      const KNOWN_TARGETS = [
+        { keys: ["x.com", "twitter", "tweet", "retweet", "post on x"], url: "https://x.com/" },
+        { keys: ["gmail", "google mail", "compose email", "send email"], url: "https://mail.google.com/" },
+        { keys: ["google calendar", "gcal"], url: "https://calendar.google.com/" },
+        { keys: ["google drive", "drive.google", "gdrive"], url: "https://drive.google.com/" },
+        { keys: ["google docs", "docs.google"], url: "https://docs.google.com/" },
+        { keys: ["youtube", "youtu.be"], url: "https://www.youtube.com/" },
+        { keys: ["github"], url: "https://github.com/" },
+        { keys: ["linkedin"], url: "https://www.linkedin.com/" },
+        { keys: ["facebook"], url: "https://www.facebook.com/" },
+        { keys: ["instagram"], url: "https://www.instagram.com/" },
+        { keys: ["reddit"], url: "https://www.reddit.com/" },
+        { keys: ["slack"], url: "https://app.slack.com/" },
+        { keys: ["discord"], url: "https://discord.com/app" },
+        { keys: ["notion"], url: "https://www.notion.so/" },
+        { keys: ["figma"], url: "https://www.figma.com/" },
+        { keys: ["amazon"], url: "https://www.amazon.com/" },
+        { keys: ["stripe"], url: "https://dashboard.stripe.com/" },
+        { keys: ["vercel"], url: "https://vercel.com/" },
+        { keys: ["airbnb"], url: "https://www.airbnb.com/" }
+      ];
+
+      function detectTargetUrlFromContext({ prompt, screenshotName }) {
+        const haystack = `${prompt || ""} ${screenshotName || ""}`.toLowerCase();
+        for (const t of KNOWN_TARGETS) {
+          if (t.keys.some((k) => haystack.includes(k))) return t.url;
+        }
+        return "";
+      }
+
+      async function runAutoPair({ targetUrl, silent }) {
+        if (!authUser) {
+          return { ok: false, reason: "not_signed_in" };
+        }
+        const existing = await fetchConnectionsList();
+        connectionIdsBeforePair = new Set(existing.map((c) => c.id));
+        const response = await fetch(apiUrl("/connections/pair/start"), {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({})
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return { ok: false, reason: data.error || "pair_start_failed" };
+        }
+        const code = data.code;
+        const sec = Number(data.expiresInSec) || 300;
+        if (!silent) {
+          pairCodeDisplay.textContent = code;
+          pairHint.textContent =
+            "Paste this code into the gif-agent Chrome extension (Load unpacked from the repo extension folder). Use the same API base URL as this page, then capture on your logged-in tab.";
+        }
+        const autoPair = await autoPairWithExtension({
+          code,
+          apiBaseUrl: API_BASE_URL,
+          targetUrl: targetUrl || "",
+          name: ""
+        });
+        return { ok: true, autoPair, sec, code };
+      }
+
       pairStartBtn.addEventListener("click", async () => {
         if (!authUser) {
           setStatus("Sign in first to generate a pairing code.", "error");
@@ -679,30 +741,12 @@
         stopPairingPoll();
         let tick = null;
         try {
-          const existing = await fetchConnectionsList();
-          connectionIdsBeforePair = new Set(existing.map((c) => c.id));
-          const response = await fetch(apiUrl("/connections/pair/start"), {
-            method: "POST",
-            credentials: "include",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({})
-          });
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            throw new Error(data.error || "Failed to start pairing.");
-          }
-          const code = data.code;
-          const sec = Number(data.expiresInSec) || 300;
-          pairCodeDisplay.textContent = code;
-          pairHint.textContent =
-            "Paste this code into the gif-agent Chrome extension (Load unpacked from the repo extension folder). Use the same API base URL as this page, then capture on your logged-in tab.";
           const targetUrlValue = (pairTargetUrl?.value || "").trim();
-          const autoPair = await autoPairWithExtension({
-            code,
-            apiBaseUrl: API_BASE_URL,
-            targetUrl: targetUrlValue,
-            name: ""
-          });
+          const started = await runAutoPair({ targetUrl: targetUrlValue, silent: false });
+          if (!started.ok) {
+            throw new Error(started.reason || "Failed to start pairing.");
+          }
+          const { autoPair, sec } = started;
           if (autoPair.ok) {
             const cap = autoPair.capture;
             if (cap?.captured && cap.connectionId) {
@@ -1032,6 +1076,30 @@
         throw new Error("Timed out waiting for GIF.");
       }
 
+      async function ensureConnectionForTask({ prompt, screenshotName }) {
+        if (connectionId.value.trim()) return { skipped: true };
+        if (!authUser) return { skipped: true, reason: "not_signed_in" };
+        const explicit = (pairTargetUrl?.value || "").trim();
+        const detected = explicit || detectTargetUrlFromContext({ prompt, screenshotName });
+        if (!detected) return { skipped: true, reason: "no_target_detected" };
+        setStatus(`Auto-capturing session for ${new URL(detected).hostname}…`, "running");
+        const started = await runAutoPair({ targetUrl: detected, silent: true });
+        if (!started.ok) {
+          return { skipped: false, ok: false, reason: started.reason };
+        }
+        const cap = started.autoPair?.capture;
+        if (started.autoPair?.ok && cap?.captured && cap.connectionId) {
+          connectionId.value = cap.connectionId;
+          pairHint.textContent = `Auto-paired and captured session for ${new URL(detected).hostname}. connectionId selected.`;
+          return { skipped: false, ok: true, connectionId: cap.connectionId };
+        }
+        return {
+          skipped: false,
+          ok: false,
+          reason: cap?.reason || started.autoPair?.error || "auto_capture_failed"
+        };
+      }
+
       submitBtn.addEventListener("click", async () => {
         const text = description.value.trim();
         if (!text) {
@@ -1048,6 +1116,13 @@
         openGifLink.style.display = "none";
 
         try {
+          const autoCap = await ensureConnectionForTask({
+            prompt: text,
+            screenshotName: selectedFile?.name || ""
+          });
+          if (!autoCap.skipped && !autoCap.ok) {
+            pairHint.textContent = `Auto-capture failed (${autoCap.reason || "unknown"}). Proceeding without a connection; if the target site requires sign-in the walkthrough may show the login wall.`;
+          }
           const formData = new FormData();
           formData.append("description", text);
           formData.append("pageUrl", window.location.href);
