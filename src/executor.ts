@@ -619,9 +619,22 @@ export async function executePlan(input: {
         break;
       case "type":
         {
-          const locator = await requireVisibleLocator(page, step, "type into", input.selectorRepair ?? {});
+          const locator = await optionalVisibleLocator(page, step, "type into", input.selectorRepair ?? {});
+          if (!locator) {
+            await applyCaption(page, `Could not type into ${step.selector}; continuing.`);
+            await page.waitForTimeout(700);
+            break;
+          }
           await moveCursorToLocator(locator);
-          await locator.fill(step.text);
+          try {
+            await locator.fill(step.text);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            console.warn(`[executor] type failed for ${step.selector}: ${detail}`);
+            await applyCaption(page, `Type into ${step.selector} did not land; continuing.`);
+            await page.waitForTimeout(700);
+            break;
+          }
         }
         await applyCaption(page, step.caption ?? `Type into ${step.selector}`);
         await page.waitForTimeout(700);
