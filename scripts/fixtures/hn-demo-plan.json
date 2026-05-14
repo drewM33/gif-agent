@@ -1,0 +1,20 @@
+{
+  "startUrl": "https://news.ycombinator.com/",
+  "steps": [
+    {
+      "action": "navigate",
+      "url": "https://news.ycombinator.com/",
+      "caption": "Open Hacker News (matches the screenshot)."
+    },
+    {
+      "action": "click",
+      "selector": "a[href='submit']",
+      "caption": "Click Submit in the top bar to open the submission form."
+    },
+    {
+      "action": "wait",
+      "ms": 1200,
+      "caption": "Wait for the submit page to load."
+    }
+  ]
+}
