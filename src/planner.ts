@@ -157,6 +157,8 @@ Return strict JSON only with this shape:
 
 Rules:
 - The screenshot is the source of truth. If the question says "here", "this page", or "this site", it means the page visible in the screenshot.
+- If the screenshot shows a third-party app inside another product's UI (for example a social feed preview inside a tooling page), plan for the embedded app, not the outer shell.
+- If the optional start URL hint points at gif-agent hosting (hostname contains "gif-agent") but the screenshot content is clearly a different product, ignore the hint and choose that product's canonical URL.
 - If the optional start URL hint is supplied and the screenshot appears to show that same app/page, use the hint as the startUrl. Do not invent a new domain from branding text.
 - Do not route to a generic search engine unless the screenshot itself is a search engine page.
 - If you recognize a canonical public page, use its canonical URL. Example: Google homepage -> https://www.google.com/.

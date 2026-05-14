@@ -20,6 +20,15 @@ function isCaptchaActionRequired(error: unknown): boolean {
   return /captcha challenge detected|timed out waiting for manual captcha solve/i.test(message);
 }
 
+function isGifAgentHostingUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host.includes("gif-agent");
+  } catch {
+    return false;
+  }
+}
+
 export async function runTask(taskId: string, options: TaskRunOptions = {}): Promise<void> {
   const task = await getTask(taskId);
   if (!task) return;
@@ -28,9 +37,13 @@ export async function runTask(taskId: string, options: TaskRunOptions = {}): Pro
     await updateTask(taskId, { status: "running", error: null });
 
     const connection = task.connectionId ? await getConnection(task.connectionId) : null;
+    let startUrlHint = connection?.startUrl ?? options.startUrlHint;
+    if (options.screenshotFilePath && startUrlHint && isGifAgentHostingUrl(startUrlHint)) {
+      startUrlHint = undefined;
+    }
     const plannerInput = {
       question: task.question,
-      startUrlHint: connection?.startUrl ?? options.startUrlHint
+      startUrlHint
     };
     const plannerOptions = {
       apiKey: options.apiKey,

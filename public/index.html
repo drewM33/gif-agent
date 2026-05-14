@@ -1272,6 +1272,15 @@
         };
       }
 
+      function appendPlannerContextToFormData(formData) {
+        const target = (pairTargetUrl?.value || "").trim();
+        if (selectedFile) {
+          if (target) formData.append("startUrlHint", target);
+        } else {
+          formData.append("pageUrl", window.location.href);
+        }
+      }
+
       submitBtn.addEventListener("click", async () => {
         const text = description.value.trim();
         if (!text) {
@@ -1298,7 +1307,7 @@
           }
           const formData = new FormData();
           formData.append("description", text);
-          formData.append("pageUrl", window.location.href);
+          appendPlannerContextToFormData(formData);
           if (selectedFile) formData.append("screenshot", selectedFile);
           const conn = connectionId.value.trim();
           if (conn) formData.append("connectionId", conn);
@@ -1398,7 +1407,7 @@
         try {
           const formData = new FormData();
           formData.append("description", prompt);
-          formData.append("pageUrl", window.location.href);
+          appendPlannerContextToFormData(formData);
           if (selectedFile) formData.append("screenshot", selectedFile);
           formData.append("connectionId", cap.connectionId);
           formData.append("llmProvider", llmProvider);
