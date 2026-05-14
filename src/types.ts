@@ -10,7 +10,7 @@ export type ConnectionRecord = {
   userId: string | null;
 };
 
-export type TaskStatus = "queued" | "running" | "done" | "error";
+export type TaskStatus = "queued" | "running" | "needs_action" | "done" | "error";
 
 export type TaskRecord = {
   id: string;

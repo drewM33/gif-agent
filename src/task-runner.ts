@@ -15,6 +15,11 @@ type TaskRunOptions = {
   llmProvider?: LlmProvider;
 };
 
+function isCaptchaActionRequired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /captcha challenge detected|timed out waiting for manual captcha solve/i.test(message);
+}
+
 export async function runTask(taskId: string, options: TaskRunOptions = {}): Promise<void> {
   const task = await getTask(taskId);
   if (!task) return;
@@ -63,6 +68,10 @@ export async function runTask(taskId: string, options: TaskRunOptions = {}): Pro
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown task failure.";
+    if (isCaptchaActionRequired(error)) {
+      await updateTask(taskId, { status: "needs_action", error: message });
+      return;
+    }
     await updateTask(taskId, { status: "error", error: message });
   }
 }

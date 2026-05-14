@@ -280,6 +280,10 @@
         border-color: #991b1b;
         color: #fca5a5;
       }
+      .status-pill.action {
+        border-color: #a16207;
+        color: #fde68a;
+      }
       .progress {
         width: 100%;
         height: 5px;
@@ -583,7 +587,15 @@
         statusEl.textContent = text;
         statusPill.textContent = type;
         statusPill.className = `status-pill ${
-          type === "running" ? "running" : type === "done" ? "done" : type === "error" ? "error" : ""
+          type === "running"
+            ? "running"
+            : type === "done"
+              ? "done"
+              : type === "error"
+                ? "error"
+                : type === "action"
+                  ? "action"
+                  : ""
         }`;
         progress.classList.toggle("active", type === "running");
       }
@@ -1054,6 +1066,53 @@
         setStatus("Cleared. Ready for a new run.", "idle");
       });
 
+      async function notifyNeedsAction(task) {
+        const targetUrl = typeof task?.plan?.startUrl === "string" ? task.plan.startUrl : "";
+        let targetHost = "the target site";
+        try {
+          if (targetUrl) targetHost = new URL(targetUrl).hostname;
+        } catch {
+          targetHost = targetUrl || targetHost;
+        }
+
+        const message = `Captcha detected on ${targetHost}. Please solve it now, then return to gif-agent and re-run.`;
+        setStatus(message, "action");
+        pairHint.textContent =
+          "Action needed: solve the captcha in your browser. After it clears, the extension can capture the refreshed session and the next run can reuse it.";
+
+        if ("Notification" in window) {
+          try {
+            const permission =
+              Notification.permission === "default"
+                ? await Notification.requestPermission()
+                : Notification.permission;
+            if (permission === "granted") {
+              const notification = new Notification("gif-agent needs you", {
+                body: message,
+                requireInteraction: true
+              });
+              notification.onclick = () => {
+                window.focus();
+                if (targetUrl) window.open(targetUrl, "_blank", "noopener");
+                notification.close();
+              };
+            }
+          } catch {
+            /* Browser notifications are best-effort. */
+          }
+        }
+
+        if (targetUrl) {
+          window.open(targetUrl, "_blank", "noopener");
+        }
+      }
+
+      function primeNotificationPermission() {
+        if (!("Notification" in window)) return;
+        if (Notification.permission !== "default") return;
+        Notification.requestPermission().catch(() => undefined);
+      }
+
       async function pollTask(taskId) {
         for (let i = 0; i < 120; i += 1) {
           const response = await fetch(apiUrl(`/tasks/${taskId}`), { credentials: "include" });
@@ -1061,6 +1120,10 @@
             throw new Error("Failed to fetch task status.");
           }
           const data = await response.json();
+          if (data.status === "needs_action") {
+            await notifyNeedsAction(data);
+            return data;
+          }
           setStatus(
             `Task ${taskId.slice(0, 8)}... is ${data.status}`,
             data.status === "done" ? "done" : data.status === "error" ? "error" : "running"
@@ -1112,6 +1175,7 @@
 
         submitBtn.disabled = true;
         clearBtn.disabled = true;
+        primeNotificationPermission();
         setStatus("Submitting task...", "running");
         resultGif.style.display = "none";
         resultGif.src = "";
@@ -1150,6 +1214,9 @@
           setStatus(`Task created: ${created.id.slice(0, 8)}... Generating walkthrough...`, "running");
 
           const done = await pollTask(created.id);
+          if (done.status === "needs_action") {
+            return;
+          }
           const gifUrl = absoluteAssetUrl(done.outputUrl);
           resultGif.src = gifUrl;
           resultGif.style.display = "block";
@@ -1244,6 +1311,9 @@
           const created = await createResp.json();
           setStatus(`Retry task created: ${created.id.slice(0, 8)}… generating walkthrough.`, "running");
           const done = await pollTask(created.id);
+          if (done.status === "needs_action") {
+            return { retried: true };
+          }
           const gifUrl = absoluteAssetUrl(done.outputUrl);
           resultGif.src = gifUrl;
           resultGif.style.display = "block";
