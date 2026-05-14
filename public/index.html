@@ -1069,7 +1069,10 @@
             return data;
           }
           if (data.status === "error") {
-            throw new Error(data.error || "Task failed.");
+            const err = new Error(data.error || "Task failed.");
+            err.taskId = taskId;
+            err.plan = data.plan || null;
+            throw err;
           }
           await new Promise((resolve) => setTimeout(resolve, 1200));
         }
@@ -1155,12 +1158,106 @@
           openGifLink.style.display = "inline-block";
           setStatus("Walkthrough ready.", "done");
         } catch (error) {
-          setStatus(`Error: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+          const message = error instanceof Error ? error.message : String(error);
+          const failedTaskId = typeof error?.taskId === "string" ? error.taskId : null;
+          const fallback = await maybeAutoCaptureAndRetry({
+            errorMessage: message,
+            failedTaskId,
+            prompt: text
+          });
+          if (fallback?.retried) {
+            return;
+          }
+          setStatus(`Error: ${message}`, "error");
         } finally {
           submitBtn.disabled = false;
           clearBtn.disabled = false;
         }
       });
+
+      function looksLikeAuthFailure(message) {
+        if (!message) return false;
+        const m = message.toLowerCase();
+        return (
+          m.includes("no visible element matched") ||
+          m.includes("could not find") ||
+          m.includes("login") ||
+          m.includes("sign in") ||
+          m.includes("not authenticated") ||
+          m.includes("requires authentication") ||
+          m.includes("could not type into")
+        );
+      }
+
+      async function fetchTaskStartUrl(taskId) {
+        if (!taskId) return "";
+        try {
+          const res = await fetch(apiUrl(`/tasks/${taskId}`), { credentials: "include" });
+          if (!res.ok) return "";
+          const data = await res.json();
+          const start = data?.plan?.startUrl;
+          return typeof start === "string" ? start : "";
+        } catch {
+          return "";
+        }
+      }
+
+      async function maybeAutoCaptureAndRetry({ errorMessage, failedTaskId, prompt }) {
+        if (!authUser) return { retried: false };
+        if (connectionId.value.trim()) return { retried: false };
+        if (!looksLikeAuthFailure(errorMessage)) return { retried: false };
+        let targetUrl = (pairTargetUrl?.value || "").trim();
+        if (!targetUrl) targetUrl = await fetchTaskStartUrl(failedTaskId);
+        if (!targetUrl) targetUrl = detectTargetUrlFromContext({ prompt, screenshotName: selectedFile?.name || "" });
+        if (!targetUrl) return { retried: false };
+
+        setStatus(`Detected auth issue — auto-capturing session for ${new URL(targetUrl).hostname}…`, "running");
+        const started = await runAutoPair({ targetUrl, silent: true });
+        const cap = started?.autoPair?.capture;
+        if (!started?.ok || !started.autoPair?.ok || !cap?.captured || !cap.connectionId) {
+          pairHint.textContent = `Auto-capture after failure could not complete: ${cap?.reason || started?.autoPair?.error || started?.reason || "unknown"}. Re-run after capturing manually.`;
+          return { retried: false };
+        }
+        connectionId.value = cap.connectionId;
+        pairHint.textContent = `Captured ${new URL(targetUrl).hostname} session — retrying walkthrough.`;
+        setStatus("Captured session — re-submitting walkthrough…", "running");
+
+        try {
+          const formData = new FormData();
+          formData.append("description", prompt);
+          formData.append("pageUrl", window.location.href);
+          if (selectedFile) formData.append("screenshot", selectedFile);
+          formData.append("connectionId", cap.connectionId);
+          formData.append("llmProvider", llmProvider);
+          const key = apiKey.value.trim();
+          if (key) formData.append("apiKey", key);
+          if (!manualAssist.disabled && manualAssist.checked) formData.append("manualAssist", "true");
+          const createResp = await fetch(apiUrl("/ui/tasks"), {
+            method: "POST",
+            credentials: "include",
+            body: formData
+          });
+          if (!createResp.ok) {
+            const err = await createResp.json().catch(() => ({}));
+            throw new Error(err.error || "Retry failed to create task.");
+          }
+          const created = await createResp.json();
+          setStatus(`Retry task created: ${created.id.slice(0, 8)}… generating walkthrough.`, "running");
+          const done = await pollTask(created.id);
+          const gifUrl = absoluteAssetUrl(done.outputUrl);
+          resultGif.src = gifUrl;
+          resultGif.style.display = "block";
+          resultEmpty.style.display = "none";
+          openGifLink.href = gifUrl;
+          openGifLink.style.display = "inline-block";
+          setStatus("Walkthrough ready (auto-recovered).", "done");
+          return { retried: true };
+        } catch (retryError) {
+          const rm = retryError instanceof Error ? retryError.message : String(retryError);
+          setStatus(`Retry after auto-capture also failed: ${rm}`, "error");
+          return { retried: false };
+        }
+      }
 
       void refreshAuthState();
     </script>
