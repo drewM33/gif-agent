@@ -10,7 +10,8 @@ import type { Plan, PlanStep } from "./types";
 
 const BLOCKED_CLICK_TEXT = /create|delete|submit|send|charge|publish/i;
 type StorageState = Exclude<BrowserContextOptions["storageState"], string | undefined>;
-const CAPTCHA_HINT_TEXT = /not a robot|unusual traffic|verify you are human|captcha|recaptcha/i;
+const CAPTCHA_HINT_TEXT =
+  /not a robot|unusual traffic|verify (that )?you are human|complete the security check|security challenge|captcha challenge|recaptcha|hcaptcha|turnstile/i;
 const SELECTOR_TIMEOUT_MS = 2_500;
 const INVISIBLE_RECAPTCHA_FRAME = /google\.com\/recaptcha\/api2\/aframe/i;
 const MAX_REPAIR_CANDIDATES = 80;
