@@ -1272,12 +1272,53 @@
         };
       }
 
+      /**
+       * When no explicit target URL is set and the heuristic detector finds
+       * nothing, fall back to the planner: ask it (via /plan/preview) to look
+       * at the screenshot and return the canonical startUrl. We cache the
+       * resulting planId so /ui/tasks can reuse the same plan and we don't
+       * pay for two LLM calls.
+       */
+      async function inferTargetViaPlanPreview({ prompt }) {
+        if (!authUser) return { ok: false, reason: "not_signed_in" };
+        const formData = new FormData();
+        formData.append("description", prompt);
+        formData.append("llmProvider", llmProvider);
+        const key = apiKey.value.trim();
+        if (key) formData.append("apiKey", key);
+        if (selectedFile) formData.append("screenshot", selectedFile);
+        try {
+          const res = await fetch(apiUrl("/plan/preview"), {
+            method: "POST",
+            credentials: "include",
+            body: formData
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            return { ok: false, reason: data.error || `plan_preview_${res.status}` };
+          }
+          const startUrl = data?.plan?.startUrl;
+          if (typeof startUrl !== "string" || !startUrl) {
+            return { ok: false, reason: "no_start_url_in_plan" };
+          }
+          return { ok: true, startUrl, planId: data.planId || null };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return { ok: false, reason: message };
+        }
+      }
+
+      let cachedPlanId = null;
+
       function appendPlannerContextToFormData(formData) {
         const target = (pairTargetUrl?.value || "").trim();
         if (selectedFile) {
           if (target) formData.append("startUrlHint", target);
         } else {
           formData.append("pageUrl", window.location.href);
+        }
+        if (cachedPlanId) {
+          formData.append("planId", cachedPlanId);
         }
       }
 
@@ -1296,8 +1337,36 @@
         resultGif.src = "";
         resultEmpty.style.display = "flex";
         openGifLink.style.display = "none";
+        cachedPlanId = null;
 
         try {
+          // If no connection is set yet, no target URL is typed, and our
+          // keyword heuristic can't infer one, ask the planner to look at the
+          // screenshot/prompt and return the canonical startUrl. We auto-fill
+          // the "Target site URL" field so the user can see what was picked,
+          // then let the existing silent auto-pair flow capture cookies.
+          if (
+            authUser &&
+            !connectionId.value.trim() &&
+            !(pairTargetUrl?.value || "").trim() &&
+            !detectTargetUrlFromContext({ prompt: text, screenshotName: selectedFile?.name || "" })
+          ) {
+            const hasKey = Boolean(apiKey.value.trim()) || Boolean(authUser?.hasSavedApiKey);
+            if (hasKey) {
+              setStatus("Identifying target site from screenshot…", "running");
+              const inferred = await inferTargetViaPlanPreview({ prompt: text });
+              if (inferred.ok) {
+                if (pairTargetUrl) pairTargetUrl.value = inferred.startUrl;
+                cachedPlanId = inferred.planId;
+                let inferredHost = inferred.startUrl;
+                try { inferredHost = new URL(inferred.startUrl).hostname; } catch {}
+                pairHint.textContent = `Target detected from screenshot: ${inferredHost}. Capturing session…`;
+              } else {
+                pairHint.textContent = `Could not auto-detect target site (${inferred.reason || "unknown"}). Submitting without session capture.`;
+              }
+            }
+          }
+
           const autoCap = await ensureConnectionForTask({
             prompt: text,
             screenshotName: selectedFile?.name || ""

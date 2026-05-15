@@ -27,7 +27,9 @@ import {
 import { importConnectionFromStorageState, parseExtraHostsField, type PlaywrightStorageState } from "./connection-import";
 import { exchangePairingCode, startExtensionPairing, verifyExtensionBearer } from "./extension-tokens";
 import { parseLlmProvider, type LlmProvider } from "./llm-provider";
+import { buildPlan, buildPlanFromScreenshot } from "./planner";
 import { runTask } from "./task-runner";
+import type { Plan } from "./types";
 
 const SAVED_KEY_PROVIDER_MISMATCH_MSG =
   "Your saved API key is registered for the other provider (Claude vs ChatGPT). Match the toggle to that provider, paste a key for the provider you selected, or click Save BYOK again after choosing the correct provider.";
@@ -45,6 +47,48 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? process.env.FRONTEND_ORIG
 const importRateBuckets = new Map<string, { n: number; resetAt: number }>();
 const IMPORT_RATE_LIMIT = 30;
 const IMPORT_RATE_WINDOW_MS = 60_000;
+
+type CachedPlan = {
+  plan: Plan;
+  expiresAt: number;
+  userId: string | null;
+  description: string;
+  manualAssist: boolean;
+  screenshotPath: string | null;
+  screenshotFilePath: string | null;
+  apiKey?: string;
+  llmProvider: LlmProvider;
+};
+
+const planCache = new Map<string, CachedPlan>();
+const PLAN_CACHE_TTL_MS = 10 * 60_000;
+const PLAN_CACHE_MAX = 200;
+
+function pruneExpiredPlans(): void {
+  const now = Date.now();
+  for (const [id, row] of planCache) {
+    if (row.expiresAt <= now) planCache.delete(id);
+  }
+  while (planCache.size > PLAN_CACHE_MAX) {
+    const oldest = planCache.keys().next().value;
+    if (!oldest) break;
+    planCache.delete(oldest);
+  }
+}
+
+function takeCachedPlan(planId: string | null, userId: string | null): CachedPlan | null {
+  if (!planId) return null;
+  pruneExpiredPlans();
+  const row = planCache.get(planId);
+  if (!row) return null;
+  if (row.expiresAt <= Date.now()) {
+    planCache.delete(planId);
+    return null;
+  }
+  if (row.userId && row.userId !== userId) return null;
+  planCache.delete(planId);
+  return row;
+}
 
 function allowImportForUser(userId: string): boolean {
   const now = Date.now();
@@ -450,6 +494,87 @@ app.post("/tasks", async (req, res) => {
   }
 });
 
+function isGifAgentHostingHostname(url: string): boolean {
+  try {
+    return new URL(url).hostname.toLowerCase().includes("gif-agent");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Plan-only endpoint. Returns the plan (and a planId that can be reused by
+ * /ui/tasks) without running the executor. Enables the frontend to auto-detect
+ * the target site URL before triggering the auto-pairing flow.
+ */
+app.post("/plan/preview", upload.single("screenshot"), async (req, res) => {
+  try {
+    const user = await getSessionUser(req.cookies?.gif_agent_session);
+    const description = String(req.body?.description ?? "").trim();
+    if (!description) {
+      res.status(400).json({ error: "description is required." });
+      return;
+    }
+    const resolved = await resolveTaskLlm(user, req.body);
+    if (resolved.savedKeyProviderMismatch) {
+      res.status(400).json({ error: SAVED_KEY_PROVIDER_MISMATCH_MSG });
+      return;
+    }
+    if (!resolved.apiKey) {
+      res.status(400).json({
+        error: "A vision-capable API key is required to preview the plan. Sign in and save BYOK, or paste a key in the UI."
+      });
+      return;
+    }
+    const startUrlHint = parseOptionalHttpUrl(req.body?.startUrlHint ?? req.body?.pageUrl);
+    const manualAssist = parseBoolean(req.body?.manualAssist);
+    const screenshotPath = req.file ? `/files/uploads/${req.file.filename}` : null;
+    const screenshotFilePath = req.file?.path ?? null;
+    const question = screenshotPath
+      ? `${description}\n\nUploaded screenshot: ${screenshotPath}`
+      : description;
+    const hint =
+      screenshotFilePath && startUrlHint && isGifAgentHostingHostname(startUrlHint) ? undefined : startUrlHint;
+    const plannerOptions = { apiKey: resolved.apiKey, llmProvider: resolved.llmProvider };
+    const plan = screenshotFilePath
+      ? await buildPlanFromScreenshot({ question, startUrlHint: hint }, screenshotFilePath, plannerOptions)
+      : await buildPlan({ question, startUrlHint: hint }, plannerOptions);
+
+    pruneExpiredPlans();
+    const planId = randomUUID();
+    planCache.set(planId, {
+      plan,
+      expiresAt: Date.now() + PLAN_CACHE_TTL_MS,
+      userId: user?.id ?? null,
+      description,
+      manualAssist,
+      screenshotPath,
+      screenshotFilePath,
+      apiKey: resolved.apiKey,
+      llmProvider: resolved.llmProvider
+    });
+
+    res.status(200).json({
+      planId,
+      expiresInSec: Math.floor(PLAN_CACHE_TTL_MS / 1000),
+      plan: {
+        startUrl: plan.startUrl,
+        stepCount: Array.isArray(plan.steps) ? plan.steps.length : 0
+      }
+    });
+  } catch (error) {
+    const status =
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      typeof (error as { status: unknown }).status === "number"
+        ? (error as { status: number }).status
+        : 500;
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(status).json({ error: message });
+  }
+});
+
 app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
   try {
     const user = await getSessionUser(req.cookies?.gif_agent_session);
@@ -476,20 +601,34 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
 
     await assertConnectionUsable(user, connectionId);
 
-    const screenshotPath = req.file ? `/files/uploads/${req.file.filename}` : null;
+    const planIdInput =
+      typeof req.body?.planId === "string" && req.body.planId.trim() ? req.body.planId.trim() : null;
+    const cached = takeCachedPlan(planIdInput, user?.id ?? null);
+
+    const screenshotPath = req.file
+      ? `/files/uploads/${req.file.filename}`
+      : cached?.screenshotPath ?? null;
     const question = screenshotPath
       ? `${description}\n\nUploaded screenshot: ${screenshotPath}`
       : description;
 
     const id = randomUUID();
     await insertTask({ id, question, connectionId });
-    void runTask(id, { manualAssist, screenshotFilePath: req.file?.path, apiKey, llmProvider, startUrlHint });
+    void runTask(id, {
+      manualAssist,
+      screenshotFilePath: req.file?.path ?? cached?.screenshotFilePath ?? undefined,
+      apiKey,
+      llmProvider,
+      startUrlHint,
+      prebuiltPlan: cached?.plan
+    });
 
     res.status(202).json({
       id,
       status: "queued",
       screenshotPath,
       manualAssist,
+      reusedPlan: Boolean(cached),
       statusUrl: `/tasks/${id}`
     });
   } catch (error) {

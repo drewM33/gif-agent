@@ -13,6 +13,11 @@ type TaskRunOptions = {
   startUrlHint?: string;
   apiKey?: string;
   llmProvider?: LlmProvider;
+  /**
+   * Optional pre-computed plan (e.g. produced by /plan/preview).
+   * When set, the planner is skipped and this plan is used directly.
+   */
+  prebuiltPlan?: Plan;
 };
 
 function isCaptchaActionRequired(error: unknown): boolean {
@@ -49,9 +54,11 @@ export async function runTask(taskId: string, options: TaskRunOptions = {}): Pro
       apiKey: options.apiKey,
       llmProvider: options.llmProvider
     };
-    const plan = options.screenshotFilePath
-      ? await buildPlanFromScreenshot(plannerInput, options.screenshotFilePath, plannerOptions)
-      : await buildPlan(plannerInput, plannerOptions);
+    const plan = options.prebuiltPlan
+      ? options.prebuiltPlan
+      : options.screenshotFilePath
+        ? await buildPlanFromScreenshot(plannerInput, options.screenshotFilePath, plannerOptions)
+        : await buildPlan(plannerInput, plannerOptions);
 
     await updateTask(taskId, { planJson: JSON.stringify(plan, null, 2) });
 
