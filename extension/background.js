@@ -357,8 +357,230 @@ async function startAttentionHandoff(payload) {
   return { ok: true, opened: true, monitoring: true };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => finish(), timeoutMs);
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    };
+    const onUpdated = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === "complete") {
+        finish();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (!tab || tab.status === "complete") {
+        finish();
+      }
+    }).catch(() => finish());
+  });
+}
+
+async function runTabStep(tabId, step) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (inputStep) => {
+      const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const query = (selector) => {
+        const direct = document.querySelector(selector);
+        if (direct) return direct;
+        const quoted = selector.match(/["']([^"']+)["']/)?.[1] || "";
+        if (quoted) {
+          const lowered = quoted.toLowerCase();
+          const candidates = Array.from(
+            document.querySelectorAll("a,button,input,textarea,select,[role='button'],[role='link']")
+          );
+          return (
+            candidates.find((el) => {
+              const text = (el.textContent || "").toLowerCase();
+              const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+              const title = (el.getAttribute("title") || "").toLowerCase();
+              return text.includes(lowered) || aria.includes(lowered) || title.includes(lowered);
+            }) || null
+          );
+        }
+        return null;
+      };
+      const caption = (text) => {
+        const id = "__gif_agent_caption";
+        let el = document.getElementById(id);
+        if (!el) {
+          el = document.createElement("div");
+          el.id = id;
+          Object.assign(el.style, {
+            position: "fixed",
+            left: "16px",
+            bottom: "16px",
+            zIndex: "2147483647",
+            background: "rgba(0,0,0,0.75)",
+            color: "#fff",
+            fontFamily: "Inter, Arial, sans-serif",
+            fontSize: "15px",
+            borderRadius: "10px",
+            padding: "10px 12px",
+            maxWidth: "65vw",
+            pointerEvents: "none"
+          });
+          (document.body || document.documentElement).appendChild(el);
+        }
+        el.textContent = text || "";
+      };
+
+      const perform = async () => {
+        if (inputStep.action === "wait") {
+          caption(inputStep.caption || `Wait ${inputStep.ms}ms`);
+          await sleepMs(Math.max(200, Number(inputStep.ms) || 600));
+          return { ok: true };
+        }
+        if (inputStep.action === "highlight" || inputStep.action === "hover" || inputStep.action === "click" || inputStep.action === "type") {
+          const el = query(inputStep.selector);
+          if (!el) {
+            caption(`Could not find ${inputStep.selector}; continuing.`);
+            return { ok: false, reason: "not_found" };
+          }
+          const node = el;
+          node.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+          await sleepMs(280);
+          if (inputStep.action === "highlight" || inputStep.action === "hover") {
+            node.style.outline = "3px solid #22c55e";
+            node.style.outlineOffset = "2px";
+          }
+          if (inputStep.action === "click") {
+            node.click();
+          }
+          if (inputStep.action === "type") {
+            node.focus();
+            if ("value" in node) {
+              node.value = inputStep.text || "";
+              node.dispatchEvent(new Event("input", { bubbles: true }));
+              node.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+          }
+          caption(inputStep.caption || `${inputStep.action} ${inputStep.selector}`);
+          await sleepMs(650);
+          return { ok: true };
+        }
+        return { ok: true };
+      };
+
+      return perform();
+    },
+    args: [step]
+  });
+}
+
+async function captureTabFrame(tab) {
+  if (!tab?.id) return null;
+  const windowId = tab.windowId;
+  try {
+    return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+  } catch {
+    return null;
+  }
+}
+
+async function startExtensionPlanExecution(payload) {
+  const taskId = String(payload?.taskId || "").trim();
+  const plan = payload?.plan;
+  if (!taskId) throw new Error("Missing taskId.");
+  if (!plan || typeof plan !== "object" || !Array.isArray(plan.steps) || !plan.startUrl) {
+    throw new Error("Missing plan payload.");
+  }
+
+  const stored = await chrome.storage.local.get(["apiBaseUrl", "extensionToken"]);
+  const apiBase = normalizeBase(payload.apiBaseUrl || stored?.apiBaseUrl);
+  const extensionToken = String(stored?.extensionToken || "");
+  if (!apiBase) throw new Error("Missing API base URL.");
+  if (!extensionToken) throw new Error("Extension is not paired yet.");
+
+  let tabId = Number(payload.tabId) || 0;
+  if (!tabId && payload.targetUrl) {
+    const found = await findTabForTarget(String(payload.targetUrl));
+    tabId = Number(found?.id || 0);
+  }
+  if (!tabId) {
+    const opened = await openOrFocusTargetTab(String(plan.startUrl));
+    tabId = Number(opened || 0);
+  }
+  if (!tabId) throw new Error("Could not open a target tab for execution.");
+
+  let tab = await chrome.tabs.get(tabId);
+  await chrome.tabs.update(tabId, { active: true });
+  if (tab.windowId !== undefined) {
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  }
+
+  const frames = [];
+  const pushFrame = async () => {
+    tab = await chrome.tabs.get(tabId);
+    const shot = await captureTabFrame(tab);
+    if (shot) frames.push(shot);
+  };
+
+  try {
+    await chrome.tabs.update(tabId, { url: String(plan.startUrl) });
+    await waitForTabComplete(tabId, 15000);
+    await sleep(500);
+    await pushFrame();
+
+    for (const step of plan.steps) {
+      if (step.action === "navigate" && step.url) {
+        await chrome.tabs.update(tabId, { url: String(step.url) });
+        await waitForTabComplete(tabId, 15000);
+        await sleep(500);
+      } else {
+        await runTabStep(tabId, step);
+        await sleep(350);
+      }
+      await pushFrame();
+      if (frames.length >= 90) break;
+    }
+
+    const doneRes = await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${extensionToken}`
+      },
+      body: JSON.stringify({ status: "done", frames })
+    });
+    const doneData = await doneRes.json().catch(() => ({}));
+    if (!doneRes.ok) {
+      throw new Error(doneData.error || `Upload HTTP ${doneRes.status}`);
+    }
+    return { ok: true, frameCount: frames.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${extensionToken}`
+      },
+      body: JSON.stringify({ status: "error", error: message })
+    }).catch(() => {});
+    throw error;
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || (message.type !== "gif_agent_auto_pair" && message.type !== "gif_agent_attention")) {
+  if (
+    !message ||
+    (message.type !== "gif_agent_auto_pair" &&
+      message.type !== "gif_agent_attention" &&
+      message.type !== "gif_agent_execute_plan")
+  ) {
     return undefined;
   }
 
@@ -367,6 +589,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const payload = message.payload || {};
       if (message.type === "gif_agent_attention") {
         const result = await startAttentionHandoff(payload);
+        sendResponse(result);
+        return;
+      }
+      if (message.type === "gif_agent_execute_plan") {
+        if (payload?.probe) {
+          sendResponse({ ok: true, available: true });
+          return;
+        }
+        const result = await startExtensionPlanExecution(payload);
         sendResponse(result);
         return;
       }

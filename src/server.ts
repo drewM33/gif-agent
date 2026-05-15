@@ -15,6 +15,7 @@ import {
   type AuthUser
 } from "./auth";
 import { finishConnectionLogin, startConnectionLogin } from "./connections";
+import { framesToGif } from "./encoder";
 import {
   getConnection,
   getTask,
@@ -22,6 +23,7 @@ import {
   insertTask,
   listConnectionsByUserId,
   revokeExtensionTokensForUserId,
+  updateTask,
   usePostgres
 } from "./db";
 import { importConnectionFromStorageState, parseExtraHostsField, type PlaywrightStorageState } from "./connection-import";
@@ -228,7 +230,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: "320kb" }));
+app.use(express.json({ limit: "12mb" }));
 app.use(cookieParser());
 app.use("/files", express.static(path.resolve("files")));
 app.use(express.static(publicDir));
@@ -593,6 +595,7 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
       String(req.body?.connectionId).trim() === ""
         ? null
         : String(req.body.connectionId).trim();
+    const executionMode = req.body?.executionMode === "extension_tab" ? "extension_tab" : "server_browser";
 
     if (!description) {
       res.status(400).json({ error: "description is required." });
@@ -614,6 +617,35 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
 
     const id = randomUUID();
     await insertTask({ id, question, connectionId });
+    if (executionMode === "extension_tab") {
+      const screenshotFilePath = req.file?.path ?? cached?.screenshotFilePath ?? undefined;
+      const plannerInput = {
+        question,
+        startUrlHint:
+          screenshotFilePath && startUrlHint && isGifAgentHostingHostname(startUrlHint) ? undefined : startUrlHint
+      };
+      const plannerOptions = { apiKey, llmProvider };
+      const plan = cached?.plan
+        ? cached.plan
+        : screenshotFilePath
+          ? await buildPlanFromScreenshot(plannerInput, screenshotFilePath, plannerOptions)
+          : await buildPlan(plannerInput, plannerOptions);
+      await updateTask(id, { status: "running", planJson: JSON.stringify(plan, null, 2), error: null });
+      res.status(202).json({
+        id,
+        status: "running",
+        screenshotPath,
+        manualAssist,
+        reusedPlan: Boolean(cached),
+        statusUrl: `/tasks/${id}`,
+        extensionExecution: {
+          taskId: id,
+          plan
+        }
+      });
+      return;
+    }
+
     void runTask(id, {
       manualAssist,
       screenshotFilePath: req.file?.path ?? cached?.screenshotFilePath ?? undefined,
@@ -641,6 +673,66 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
         : 500;
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(status).json({ error: message });
+  }
+});
+
+app.post("/tasks/:id/extension-result", async (req, res) => {
+  try {
+    const bearerUserId = await verifyExtensionBearer(req.get("authorization"));
+    if (!bearerUserId) {
+      res.status(401).json({ error: "Valid extension Bearer token required." });
+      return;
+    }
+
+    const task = await getTask(req.params.id);
+    if (!task) {
+      res.status(404).json({ error: "Task not found." });
+      return;
+    }
+
+    if (String(req.body?.status || "") === "error") {
+      const message = String(req.body?.error || "Extension execution failed.");
+      await updateTask(req.params.id, { status: "error", error: message });
+      res.json({ ok: true, status: "error" });
+      return;
+    }
+
+    const frames = Array.isArray(req.body?.frames)
+      ? req.body.frames.filter((v: unknown): v is string => typeof v === "string")
+      : [];
+    if (frames.length === 0) {
+      res.status(400).json({ error: "frames array is required." });
+      return;
+    }
+    if (frames.length > 120) {
+      res.status(400).json({ error: "Too many frames." });
+      return;
+    }
+
+    const recordingsDir = path.join("files", "recordings", req.params.id);
+    const framesDir = path.join(recordingsDir, "frames");
+    fs.mkdirSync(framesDir, { recursive: true });
+    for (const [index, frame] of frames.entries()) {
+      const pngMatch = frame.match(/^data:image\/png;base64,([\s\S]+)$/i);
+      if (!pngMatch) continue;
+      const output = path.join(framesDir, `frame-${String(index + 1).padStart(4, "0")}.png`);
+      fs.writeFileSync(output, Buffer.from(pngMatch[1], "base64"));
+    }
+
+    const gifPath = path.join("files", "recordings", req.params.id, "video.gif");
+    await framesToGif({
+      framesDir,
+      outputGifPath: gifPath
+    });
+    await updateTask(req.params.id, {
+      status: "done",
+      outputUrl: `/files/recordings/${req.params.id}/video.gif`,
+      error: null
+    });
+    res.json({ ok: true, status: "done" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: message });
   }
 });
 

@@ -722,6 +722,80 @@
         });
       }
 
+      function probeExtensionExecutionBridge() {
+        const requestId = `probe_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        return new Promise((resolve) => {
+          const timeout = window.setTimeout(() => {
+            cleanup();
+            resolve(false);
+          }, 900);
+
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", onMessage);
+          };
+
+          const onMessage = (event) => {
+            if (event.source !== window) return;
+            const msg = event.data;
+            if (!msg || msg.type !== "gif_agent_execute_plan_response" || msg.requestId !== requestId) return;
+            cleanup();
+            resolve(Boolean(msg.ok));
+          };
+
+          window.addEventListener("message", onMessage);
+          window.postMessage(
+            {
+              type: "gif_agent_execute_plan_request",
+              requestId,
+              payload: { probe: true }
+            },
+            "*"
+          );
+        });
+      }
+
+      function executePlanWithExtension({ taskId, plan, targetUrl }) {
+        const requestId = `exec_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        return new Promise((resolve) => {
+          const timeout = window.setTimeout(() => {
+            cleanup();
+            resolve({ ok: false, error: "Extension execution timed out." });
+          }, 120000);
+
+          const cleanup = () => {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", onMessage);
+          };
+
+          const onMessage = (event) => {
+            if (event.source !== window) return;
+            const msg = event.data;
+            if (!msg || msg.type !== "gif_agent_execute_plan_response" || msg.requestId !== requestId) return;
+            cleanup();
+            resolve({
+              ok: Boolean(msg.ok),
+              error: msg.error || null
+            });
+          };
+
+          window.addEventListener("message", onMessage);
+          window.postMessage(
+            {
+              type: "gif_agent_execute_plan_request",
+              requestId,
+              payload: {
+                taskId,
+                plan,
+                apiBaseUrl: API_BASE_URL,
+                targetUrl: targetUrl || ""
+              }
+            },
+            "*"
+          );
+        });
+      }
+
       async function startAttentionHandoff(targetUrl) {
         if (!authUser || !targetUrl) {
           return { ok: false, error: "Sign in to gif-agent before extension-assisted captcha handoff." };
@@ -1384,6 +1458,10 @@
           const key = apiKey.value.trim();
           if (key) formData.append("apiKey", key);
           if (!manualAssist.disabled && manualAssist.checked) formData.append("manualAssist", "true");
+          const useExtensionExecution = await probeExtensionExecutionBridge();
+          if (useExtensionExecution) {
+            formData.append("executionMode", "extension_tab");
+          }
 
           const createResp = await fetch(apiUrl("/ui/tasks"), {
             method: "POST",
@@ -1395,7 +1473,23 @@
             throw new Error(err.error || "Failed to create task.");
           }
           const created = await createResp.json();
-          setStatus(`Task created: ${created.id.slice(0, 8)}... Generating walkthrough...`, "running");
+          if (useExtensionExecution && created?.extensionExecution?.taskId && created?.extensionExecution?.plan) {
+            setStatus("Task created. Running steps in your active browser tab…", "running");
+            const extensionRun = await executePlanWithExtension({
+              taskId: created.extensionExecution.taskId,
+              plan: created.extensionExecution.plan,
+              targetUrl:
+                (pairTargetUrl?.value || "").trim() ||
+                created.extensionExecution.plan.startUrl ||
+                ""
+            });
+            if (!extensionRun.ok) {
+              throw new Error(extensionRun.error || "Extension execution failed.");
+            }
+            setStatus(`Task ${created.id.slice(0, 8)}... rendering GIF...`, "running");
+          } else {
+            setStatus(`Task created: ${created.id.slice(0, 8)}... Generating walkthrough...`, "running");
+          }
 
           const done = await pollTask(created.id);
           if (done.status === "needs_action") {
