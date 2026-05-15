@@ -622,8 +622,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: true, available: true });
           return;
         }
-        const result = await startExtensionPlanExecution(payload);
-        sendResponse(result);
+        startExtensionPlanExecution(payload).catch((error) => {
+          console.error("[gif-agent] extension execution failed", error);
+        });
+        sendResponse({ ok: true, started: true });
         return;
       }
 

@@ -730,6 +730,7 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
     const frames = Array.isArray(req.body?.frames)
       ? req.body.frames.filter((v: unknown): v is string => typeof v === "string")
       : [];
+    console.log(`[extension-result] task=${req.params.id} status=done uploadedFrames=${frames.length}`);
     if (frames.length === 0) {
       res.status(400).json({ error: "frames array is required." });
       return;
@@ -760,6 +761,9 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
       res.status(400).json({ error: "No valid image frames were uploaded." });
       return;
     }
+    console.log(
+      `[extension-result] task=${req.params.id} writtenFrames=${writtenFrames} frameExtension=${frameExtension}`
+    );
 
     const gifPath = path.join("files", "recordings", req.params.id, "video.gif");
     await framesToGif({
@@ -775,6 +779,7 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
     res.json({ ok: true, status: "done" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
+    console.error(`[extension-result] task=${req.params.id} failed: ${message}`);
     res.status(500).json({ error: message });
   }
 });

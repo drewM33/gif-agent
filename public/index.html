@@ -760,8 +760,8 @@
         return new Promise((resolve) => {
           const timeout = window.setTimeout(() => {
             cleanup();
-            resolve({ ok: false, error: "Extension execution timed out." });
-          }, 120000);
+            resolve({ ok: false, error: "Extension did not acknowledge execution start." });
+          }, 8000);
 
           const cleanup = () => {
             window.clearTimeout(timeout);
@@ -775,6 +775,7 @@
             cleanup();
             resolve({
               ok: Boolean(msg.ok),
+              started: Boolean(msg.started),
               error: msg.error || null
             });
           };
@@ -1294,7 +1295,7 @@
       }
 
       async function pollTask(taskId) {
-        for (let i = 0; i < 120; i += 1) {
+        for (let i = 0; i < 240; i += 1) {
           const response = await fetch(apiUrl(`/tasks/${taskId}`), { credentials: "include" });
           if (!response.ok) {
             throw new Error("Failed to fetch task status.");
@@ -1484,9 +1485,9 @@
                 ""
             });
             if (!extensionRun.ok) {
-              throw new Error(extensionRun.error || "Extension execution failed.");
+              throw new Error(extensionRun.error || "Extension execution did not start.");
             }
-            setStatus(`Task ${created.id.slice(0, 8)}... rendering GIF...`, "running");
+            setStatus(`Task ${created.id.slice(0, 8)}... extension is recording; waiting for GIF render...`, "running");
           } else {
             setStatus(`Task created: ${created.id.slice(0, 8)}... Generating walkthrough...`, "running");
           }
