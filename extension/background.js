@@ -490,6 +490,30 @@ async function captureTabFrame(tab) {
   }
 }
 
+function isExtensionExecutableUrl(url) {
+  try {
+    const parsed = new URL(String(url || ""));
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function assertExtensionExecutablePlan(plan) {
+  if (!isExtensionExecutableUrl(plan.startUrl)) {
+    throw new Error(
+      `Chrome blocks extensions from automating browser-internal pages like ${plan.startUrl}. Open chrome://extensions manually, turn on Developer mode, then click Load unpacked.`
+    );
+  }
+  for (const step of plan.steps || []) {
+    if (step?.action === "navigate" && !isExtensionExecutableUrl(step.url)) {
+      throw new Error(
+        `Chrome blocks extensions from navigating to browser-internal pages like ${step.url}. Open that page manually.`
+      );
+    }
+  }
+}
+
 async function startExtensionPlanExecution(payload) {
   const taskId = String(payload?.taskId || "").trim();
   const plan = payload?.plan;
@@ -497,6 +521,7 @@ async function startExtensionPlanExecution(payload) {
   if (!plan || typeof plan !== "object" || !Array.isArray(plan.steps) || !plan.startUrl) {
     throw new Error("Missing plan payload.");
   }
+  assertExtensionExecutablePlan(plan);
 
   const stored = await chrome.storage.local.get(["apiBaseUrl", "extensionToken"]);
   const apiBase = normalizeBase(payload.apiBaseUrl || stored?.apiBaseUrl);

@@ -504,6 +504,27 @@ function isGifAgentHostingHostname(url: string): boolean {
   }
 }
 
+function isBrowserExecutableUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function unsupportedPlanUrl(plan: Plan): string | null {
+  if (!isBrowserExecutableUrl(plan.startUrl)) {
+    return plan.startUrl;
+  }
+  for (const step of plan.steps) {
+    if (step.action === "navigate" && !isBrowserExecutableUrl(step.url)) {
+      return step.url;
+    }
+  }
+  return null;
+}
+
 /**
  * Plan-only endpoint. Returns the plan (and a planId that can be reused by
  * /ui/tasks) without running the executor. Enables the frontend to auto-detect
@@ -630,6 +651,15 @@ app.post("/ui/tasks", upload.single("screenshot"), async (req, res) => {
         : screenshotFilePath
           ? await buildPlanFromScreenshot(plannerInput, screenshotFilePath, plannerOptions)
           : await buildPlan(plannerInput, plannerOptions);
+      const unsupportedUrl = unsupportedPlanUrl(plan);
+      if (unsupportedUrl) {
+        const message =
+          `Chrome blocks extensions and web apps from automating browser-internal pages like ${unsupportedUrl}. ` +
+          "Open chrome://extensions manually, turn on Developer mode, then click Load unpacked.";
+        await updateTask(id, { status: "error", planJson: JSON.stringify(plan, null, 2), error: message });
+        res.status(400).json({ error: message, statusUrl: `/tasks/${id}` });
+        return;
+      }
       await updateTask(id, { status: "running", planJson: JSON.stringify(plan, null, 2), error: null });
       res.status(202).json({
         id,
