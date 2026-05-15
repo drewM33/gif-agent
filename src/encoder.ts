@@ -37,10 +37,12 @@ export async function videoToGif(input: {
 export async function framesToGif(input: {
   framesDir: string;
   outputGifPath: string;
+  frameExtension?: "jpg" | "png";
   fps?: number;
 }): Promise<void> {
   const fps = input.fps ?? 1.4;
-  const framePattern = path.join(input.framesDir, "frame-%04d.png");
+  const frameExtension = input.frameExtension ?? "png";
+  const framePattern = path.join(input.framesDir, `frame-%04d.${frameExtension}`);
   await runFfmpeg([
     "-y",
     "-framerate",

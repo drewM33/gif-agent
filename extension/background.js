@@ -484,7 +484,7 @@ async function captureTabFrame(tab) {
   if (!tab?.id) return null;
   const windowId = tab.windowId;
   try {
-    return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+    return await chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 58 });
   } catch {
     return null;
   }
@@ -569,7 +569,7 @@ async function startExtensionPlanExecution(payload) {
         await sleep(350);
       }
       await pushFrame();
-      if (frames.length >= 90) break;
+      if (frames.length >= 36) break;
     }
 
     const doneRes = await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {

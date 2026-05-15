@@ -230,7 +230,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "50mb" }));
 app.use(cookieParser());
 app.use("/files", express.static(path.resolve("files")));
 app.use(express.static(publicDir));
@@ -742,17 +742,30 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
     const recordingsDir = path.join("files", "recordings", req.params.id);
     const framesDir = path.join(recordingsDir, "frames");
     fs.mkdirSync(framesDir, { recursive: true });
-    for (const [index, frame] of frames.entries()) {
-      const pngMatch = frame.match(/^data:image\/png;base64,([\s\S]+)$/i);
-      if (!pngMatch) continue;
-      const output = path.join(framesDir, `frame-${String(index + 1).padStart(4, "0")}.png`);
-      fs.writeFileSync(output, Buffer.from(pngMatch[1], "base64"));
+    let writtenFrames = 0;
+    let frameExtension: "jpg" | "png" = "png";
+    for (const frame of frames) {
+      const match = frame.match(/^data:image\/(png|jpe?g);base64,([\s\S]+)$/i);
+      if (!match) continue;
+      const nextExtension = /^jpe?g$/i.test(match[1]) ? "jpg" : "png";
+      if (writtenFrames === 0) {
+        frameExtension = nextExtension;
+      }
+      if (nextExtension !== frameExtension) continue;
+      writtenFrames += 1;
+      const output = path.join(framesDir, `frame-${String(writtenFrames).padStart(4, "0")}.${frameExtension}`);
+      fs.writeFileSync(output, Buffer.from(match[2], "base64"));
+    }
+    if (writtenFrames === 0) {
+      res.status(400).json({ error: "No valid image frames were uploaded." });
+      return;
     }
 
     const gifPath = path.join("files", "recordings", req.params.id, "video.gif");
     await framesToGif({
       framesDir,
-      outputGifPath: gifPath
+      outputGifPath: gifPath,
+      frameExtension
     });
     await updateTask(req.params.id, {
       status: "done",
