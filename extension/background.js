@@ -527,17 +527,22 @@ async function runTabStep(tabId, step) {
           if (!cursor) {
             cursor = document.createElement("div");
             cursor.id = "__gif_agent_cursor";
+            cursor.textContent = "☝";
             Object.assign(cursor.style, {
               position: "fixed",
-              width: "30px",
-              height: "30px",
-              borderRadius: "999px 999px 999px 6px",
-              background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
-              border: "3px solid rgba(255,255,255,0.95)",
-              boxShadow: "0 6px 18px rgba(0,0,0,0.45)",
+              width: "54px",
+              height: "54px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "#f8fafc",
+              fontSize: "42px",
+              lineHeight: "1",
+              textShadow: "0 2px 4px rgba(0,0,0,0.65), 0 0 0 3px rgba(255,255,255,0.9)",
+              filter: "drop-shadow(0 8px 14px rgba(0,0,0,0.45))",
               zIndex: "2147483647",
               pointerEvents: "none",
-              transform: "translate(-50%, -50%) rotate(-45deg)",
+              transform: "translate(-24%, -88%) rotate(-18deg)",
               transition: "left 0.35s ease, top 0.35s ease"
             });
             (document.body || document.documentElement).appendChild(cursor);
