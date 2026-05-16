@@ -387,10 +387,21 @@ async function waitForTabComplete(tabId, timeoutMs = 12000) {
   });
 }
 
+function isTransientFrameError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return (
+    message.includes("Frame with ID 0 was removed") ||
+    message.includes("No frame with id") ||
+    message.includes("Extension context invalidated") ||
+    message.includes("The tab was closed")
+  );
+}
+
 async function runTabStep(tabId, step) {
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: (inputStep) => {
+  const execute = () =>
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: (inputStep) => {
       const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       const query = (selector) => {
         const direct = document.querySelector(selector);
@@ -476,18 +487,61 @@ async function runTabStep(tabId, step) {
 
       return perform();
     },
-    args: [step]
-  });
+      args: [step]
+    });
+
+  try {
+    await execute();
+  } catch (error) {
+    if (!isTransientFrameError(error)) throw error;
+    await waitForTabComplete(tabId, 10000);
+    await sleep(500);
+    await execute();
+  }
 }
 
 async function captureTabFrame(tab) {
   if (!tab?.id) return null;
   const windowId = tab.windowId;
-  try {
-    return await chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 58 });
-  } catch {
-    return null;
+  const focusTab = async () => {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    if (windowId !== undefined) {
+      await chrome.windows.update(windowId, { focused: true }).catch(() => {});
+    }
+    await sleep(250);
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await focusTab();
+      const captured = await chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 58 });
+      if (captured) return captured;
+    } catch (error) {
+      console.warn(`[gif-agent] captureVisibleTab failed attempt=${attempt + 1}`, error);
+      await sleep(350);
+    }
   }
+
+  try {
+    const target = { tabId: tab.id };
+    await chrome.debugger.attach(target, "1.3");
+    const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality: 58,
+      fromSurface: true
+    });
+    await chrome.debugger.detach(target).catch(() => {});
+    if (result?.data) {
+      return `data:image/jpeg;base64,${result.data}`;
+    }
+  } catch (error) {
+    console.warn("[gif-agent] debugger screenshot fallback failed", error);
+    if (tab?.id) {
+      await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+    }
+  }
+
+  return null;
 }
 
 function isExtensionExecutableUrl(url) {
@@ -550,7 +604,12 @@ async function startExtensionPlanExecution(payload) {
   const pushFrame = async () => {
     tab = await chrome.tabs.get(tabId);
     const shot = await captureTabFrame(tab);
-    if (shot) frames.push(shot);
+    if (!shot) {
+      console.warn(`[gif-agent] no frame captured for tab=${tabId} url=${tab?.url || ""}`);
+      return false;
+    }
+    frames.push(shot);
+    return true;
   };
 
   try {
@@ -570,6 +629,10 @@ async function startExtensionPlanExecution(payload) {
       }
       await pushFrame();
       if (frames.length >= 36) break;
+    }
+
+    if (frames.length === 0) {
+      throw new Error("The extension could not capture any screen frames. Check Chrome extension permissions and reload the unpacked extension.");
     }
 
     const doneRes = await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
