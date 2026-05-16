@@ -2,6 +2,9 @@
 
 const EXTENSION_VERSION = (chrome.runtime.getManifest?.()?.version) || "1.2.0";
 const pendingAttentionCaptures = new Map();
+const RECORDER_FPS = 4;
+const RECORDER_INTERVAL_MS = Math.round(1000 / RECORDER_FPS);
+const MAX_RECORDED_FRAMES = 110;
 
 function compareSemver(a, b) {
   const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
@@ -408,7 +411,7 @@ async function startFrameRecorder(tabId) {
   attached = true;
 
   const capture = async () => {
-    if (stopped || inFlight) return;
+    if (stopped || inFlight || frames.length >= MAX_RECORDED_FRAMES) return;
     inFlight = true;
     try {
       const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
@@ -418,6 +421,10 @@ async function startFrameRecorder(tabId) {
       });
       if (result?.data) {
         frames.push(`data:image/jpeg;base64,${result.data}`);
+        if (frames.length >= MAX_RECORDED_FRAMES) {
+          stopped = true;
+          clearInterval(timer);
+        }
       }
     } catch (error) {
       console.warn("[gif-agent] debugger frame capture skipped", error);
@@ -428,11 +435,12 @@ async function startFrameRecorder(tabId) {
 
   const timer = setInterval(() => {
     capture().catch((error) => console.warn("[gif-agent] frame capture loop failed", error));
-  }, 180);
+  }, RECORDER_INTERVAL_MS);
   await capture();
 
   return {
     frames,
+    fps: RECORDER_FPS,
     async stop() {
       stopped = true;
       clearInterval(timer);
@@ -710,7 +718,7 @@ async function startExtensionPlanExecution(payload) {
       body: JSON.stringify({
         status: "done",
         frames,
-        frameFps: 8
+        frameFps: recorder.fps
       })
     });
     const doneData = await doneRes.json().catch(() => ({}));
