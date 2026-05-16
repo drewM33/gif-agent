@@ -3,7 +3,7 @@
   "name": "gif-agent session capture",
   "version": "1.2.0",
   "description": "Capture cookies and storage from your logged-in browser for gif-agent walkthroughs.",
-  "permissions": ["cookies", "storage", "activeTab", "scripting", "tabs", "alarms", "debugger"],
+  "permissions": ["cookies", "storage", "activeTab", "scripting", "tabs", "alarms", "debugger", "tabCapture", "offscreen"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"
@@ -19,6 +19,12 @@
       ],
       "js": ["content-script.js"],
       "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["offscreen.html"],
+      "matches": ["<all_urls>"]
     }
   ],
   "action": {

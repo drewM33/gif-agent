@@ -397,6 +397,49 @@ function isTransientFrameError(error) {
   );
 }
 
+async function ensureOffscreenRecorder() {
+  if (!chrome.offscreen) {
+    throw new Error("Chrome offscreen documents are unavailable; update Chrome to use tab video recording.");
+  }
+  const hasDocument = await chrome.offscreen.hasDocument();
+  if (hasDocument) return;
+  await chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["USER_MEDIA"],
+    justification: "Record the target tab as a tutorial video for GIF rendering."
+  });
+}
+
+function sendOffscreenMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      const runtimeError = chrome.runtime.lastError?.message;
+      if (runtimeError) {
+        reject(new Error(runtimeError));
+        return;
+      }
+      if (!response?.ok) {
+        reject(new Error(response?.error || "Offscreen recorder failed."));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function startTabRecording(tabId) {
+  await ensureOffscreenRecorder();
+  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  if (!streamId) {
+    throw new Error("Chrome did not provide a tab capture stream id.");
+  }
+  await sendOffscreenMessage({ type: "gif_agent_offscreen_start", streamId });
+}
+
+async function stopTabRecording() {
+  return sendOffscreenMessage({ type: "gif_agent_offscreen_stop" });
+}
+
 async function runTabStep(tabId, step) {
   const execute = () =>
     chrome.scripting.executeScript({
@@ -463,6 +506,29 @@ async function runTabStep(tabId, step) {
           const node = el;
           node.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
           await sleepMs(280);
+          const box = node.getBoundingClientRect();
+          let cursor = document.getElementById("__gif_agent_cursor");
+          if (!cursor) {
+            cursor = document.createElement("div");
+            cursor.id = "__gif_agent_cursor";
+            Object.assign(cursor.style, {
+              position: "fixed",
+              width: "30px",
+              height: "30px",
+              borderRadius: "999px 999px 999px 6px",
+              background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
+              border: "3px solid rgba(255,255,255,0.95)",
+              boxShadow: "0 6px 18px rgba(0,0,0,0.45)",
+              zIndex: "2147483647",
+              pointerEvents: "none",
+              transform: "translate(-50%, -50%) rotate(-45deg)",
+              transition: "left 0.35s ease, top 0.35s ease"
+            });
+            (document.body || document.documentElement).appendChild(cursor);
+          }
+          cursor.style.left = `${box.left + box.width / 2}px`;
+          cursor.style.top = `${box.top + box.height / 2}px`;
+          await sleepMs(450);
           if (inputStep.action === "highlight" || inputStep.action === "hover") {
             node.style.outline = "3px solid #22c55e";
             node.style.outlineOffset = "2px";
@@ -613,27 +679,25 @@ async function startExtensionPlanExecution(payload) {
   };
 
   try {
+    await startTabRecording(tabId);
     await chrome.tabs.update(tabId, { url: String(plan.startUrl) });
     await waitForTabComplete(tabId, 15000);
-    await sleep(500);
-    await pushFrame();
+    await sleep(900);
 
     for (const step of plan.steps) {
       if (step.action === "navigate" && step.url) {
         await chrome.tabs.update(tabId, { url: String(step.url) });
         await waitForTabComplete(tabId, 15000);
-        await sleep(500);
+        await sleep(900);
       } else {
         await runTabStep(tabId, step);
-        await sleep(350);
+        await waitForTabComplete(tabId, 5000);
+        await sleep(650);
       }
-      await pushFrame();
-      if (frames.length >= 36) break;
     }
 
-    if (frames.length === 0) {
-      throw new Error("The extension could not capture any screen frames. Check Chrome extension permissions and reload the unpacked extension.");
-    }
+    await sleep(900);
+    const recording = await stopTabRecording();
 
     const doneRes = await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
       method: "POST",
@@ -641,7 +705,14 @@ async function startExtensionPlanExecution(payload) {
         "content-type": "application/json",
         authorization: `Bearer ${extensionToken}`
       },
-      body: JSON.stringify({ status: "done", frames })
+      body: JSON.stringify({
+        status: "done",
+        video: {
+          dataUrl: recording.dataUrl,
+          mimeType: recording.mimeType,
+          byteLength: recording.byteLength
+        }
+      })
     });
     const doneData = await doneRes.json().catch(() => ({}));
     if (!doneRes.ok) {
@@ -650,6 +721,7 @@ async function startExtensionPlanExecution(payload) {
     return { ok: true, frameCount: frames.length };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    await stopTabRecording().catch(() => {});
     await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
       method: "POST",
       headers: {

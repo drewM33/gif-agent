@@ -15,7 +15,7 @@ import {
   type AuthUser
 } from "./auth";
 import { finishConnectionLogin, startConnectionLogin } from "./connections";
-import { framesToGif } from "./encoder";
+import { framesToGif, videoToGif } from "./encoder";
 import {
   getConnection,
   getTask,
@@ -230,7 +230,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "120mb" }));
 app.use(cookieParser());
 app.use("/files", express.static(path.resolve("files")));
 app.use(express.static(publicDir));
@@ -724,6 +724,36 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
       const message = String(req.body?.error || "Extension execution failed.");
       await updateTask(req.params.id, { status: "error", error: message });
       res.json({ ok: true, status: "error" });
+      return;
+    }
+
+    const video = req.body?.video as { dataUrl?: unknown; mimeType?: unknown; byteLength?: unknown } | undefined;
+    if (video && typeof video.dataUrl === "string") {
+      const match = video.dataUrl.match(/^data:video\/(webm|mp4|x-matroska);base64,([\s\S]+)$/i);
+      if (!match) {
+        res.status(400).json({ error: "Invalid video data URL." });
+        return;
+      }
+      const extension = match[1].toLowerCase() === "mp4" ? "mp4" : "webm";
+      const recordingsDir = path.join("files", "recordings", req.params.id);
+      fs.mkdirSync(recordingsDir, { recursive: true });
+      const videoPath = path.join(recordingsDir, `extension-recording.${extension}`);
+      fs.writeFileSync(videoPath, Buffer.from(match[2], "base64"));
+      console.log(
+        `[extension-result] task=${req.params.id} videoBytes=${fs.statSync(videoPath).size} mime=${String(video.mimeType || "")}`
+      );
+
+      const gifPath = path.join("files", "recordings", req.params.id, "video.gif");
+      await videoToGif({
+        videoPath,
+        outputGifPath: gifPath
+      });
+      await updateTask(req.params.id, {
+        status: "done",
+        outputUrl: `/files/recordings/${req.params.id}/video.gif`,
+        error: null
+      });
+      res.json({ ok: true, status: "done" });
       return;
     }
 
