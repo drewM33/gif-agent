@@ -799,7 +799,8 @@ app.post("/tasks/:id/extension-result", async (req, res) => {
     await framesToGif({
       framesDir,
       outputGifPath: gifPath,
-      frameExtension
+      frameExtension,
+      fps: typeof req.body?.frameFps === "number" ? req.body.frameFps : undefined
     });
     await updateTask(req.params.id, {
       status: "done",

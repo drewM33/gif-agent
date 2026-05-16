@@ -397,47 +397,55 @@ function isTransientFrameError(error) {
   );
 }
 
-async function ensureOffscreenRecorder() {
-  if (!chrome.offscreen) {
-    throw new Error("Chrome offscreen documents are unavailable; update Chrome to use tab video recording.");
-  }
-  const hasDocument = await chrome.offscreen.hasDocument();
-  if (hasDocument) return;
-  await chrome.offscreen.createDocument({
-    url: "offscreen.html",
-    reasons: ["USER_MEDIA"],
-    justification: "Record the target tab as a tutorial video for GIF rendering."
-  });
-}
+async function startFrameRecorder(tabId) {
+  const target = { tabId };
+  const frames = [];
+  let attached = false;
+  let stopped = false;
+  let inFlight = false;
 
-function sendOffscreenMessage(message) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      const runtimeError = chrome.runtime.lastError?.message;
-      if (runtimeError) {
-        reject(new Error(runtimeError));
-        return;
+  await chrome.debugger.attach(target, "1.3");
+  attached = true;
+
+  const capture = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "jpeg",
+        quality: 62,
+        fromSurface: true
+      });
+      if (result?.data) {
+        frames.push(`data:image/jpeg;base64,${result.data}`);
       }
-      if (!response?.ok) {
-        reject(new Error(response?.error || "Offscreen recorder failed."));
-        return;
+    } catch (error) {
+      console.warn("[gif-agent] debugger frame capture skipped", error);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    capture().catch((error) => console.warn("[gif-agent] frame capture loop failed", error));
+  }, 180);
+  await capture();
+
+  return {
+    frames,
+    async stop() {
+      stopped = true;
+      clearInterval(timer);
+      while (inFlight) {
+        await sleep(50);
       }
-      resolve(response);
-    });
-  });
-}
-
-async function startTabRecording(tabId) {
-  await ensureOffscreenRecorder();
-  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
-  if (!streamId) {
-    throw new Error("Chrome did not provide a tab capture stream id.");
-  }
-  await sendOffscreenMessage({ type: "gif_agent_offscreen_start", streamId });
-}
-
-async function stopTabRecording() {
-  return sendOffscreenMessage({ type: "gif_agent_offscreen_stop" });
+      if (attached) {
+        attached = false;
+        await chrome.debugger.detach(target).catch(() => {});
+      }
+      return frames;
+    }
+  };
 }
 
 async function runTabStep(tabId, step) {
@@ -666,20 +674,10 @@ async function startExtensionPlanExecution(payload) {
     await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   }
 
-  const frames = [];
-  const pushFrame = async () => {
-    tab = await chrome.tabs.get(tabId);
-    const shot = await captureTabFrame(tab);
-    if (!shot) {
-      console.warn(`[gif-agent] no frame captured for tab=${tabId} url=${tab?.url || ""}`);
-      return false;
-    }
-    frames.push(shot);
-    return true;
-  };
+  let recorder = null;
 
   try {
-    await startTabRecording(tabId);
+    recorder = await startFrameRecorder(tabId);
     await chrome.tabs.update(tabId, { url: String(plan.startUrl) });
     await waitForTabComplete(tabId, 15000);
     await sleep(900);
@@ -697,7 +695,11 @@ async function startExtensionPlanExecution(payload) {
     }
 
     await sleep(900);
-    const recording = await stopTabRecording();
+    const frames = await recorder.stop();
+    recorder = null;
+    if (frames.length === 0) {
+      throw new Error("The extension did not capture any tutorial frames.");
+    }
 
     const doneRes = await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
       method: "POST",
@@ -707,11 +709,8 @@ async function startExtensionPlanExecution(payload) {
       },
       body: JSON.stringify({
         status: "done",
-        video: {
-          dataUrl: recording.dataUrl,
-          mimeType: recording.mimeType,
-          byteLength: recording.byteLength
-        }
+        frames,
+        frameFps: 8
       })
     });
     const doneData = await doneRes.json().catch(() => ({}));
@@ -721,7 +720,9 @@ async function startExtensionPlanExecution(payload) {
     return { ok: true, frameCount: frames.length };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await stopTabRecording().catch(() => {});
+    if (recorder) {
+      await recorder.stop().catch(() => {});
+    }
     await fetch(`${apiBase}/tasks/${taskId}/extension-result`, {
       method: "POST",
       headers: {
