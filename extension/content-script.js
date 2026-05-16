@@ -39,6 +39,10 @@ window.addEventListener("message", (event) => {
           ok: Boolean(response?.ok) && !runtimeError,
           error: runtimeError || response?.error || null,
           capture: response?.capture || null,
+          available: Boolean(response?.available),
+          paired: Boolean(response?.paired),
+          started: Boolean(response?.started),
+          frameCount: Number(response?.frameCount || 0),
           opened: Boolean(response?.opened),
           monitoring: Boolean(response?.monitoring)
         },

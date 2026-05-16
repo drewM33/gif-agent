@@ -619,7 +619,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       if (message.type === "gif_agent_execute_plan") {
         if (payload?.probe) {
-          sendResponse({ ok: true, available: true });
+          const stored = await chrome.storage.local.get(["apiBaseUrl", "extensionToken"]);
+          sendResponse({
+            ok: Boolean(stored?.extensionToken),
+            available: true,
+            paired: Boolean(stored?.extensionToken),
+            error: stored?.extensionToken ? null : "Extension is installed but not paired yet."
+          });
           return;
         }
         startExtensionPlanExecution(payload).catch((error) => {
